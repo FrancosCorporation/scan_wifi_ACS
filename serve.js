@@ -16,6 +16,7 @@ const CLIENT_ID = 'REDACTED';
 const CLIENT_SECRET = 'REDACTED';
 
 const LOG_FILE = path.join(__dirname, 'flashman_logs.json');
+const FLASHMAN_MAX_PAGE_SIZE = 50;
 
 // ============================================================
 // 📝 SISTEMA DE LOGS
@@ -113,25 +114,52 @@ async function getAuthHeaders() {
 // ============================================================
 
 app.get('/api/devices', async (req, res) => {
-  const qty = req.query.qty || 10;
+  const qty = parseInt(req.query.qty) || 10;
   try {
-    addLog('DEVICES', `Buscando ${qty} dispositivos`, 'info', { qty });
+    addLog('DEVICES', `Buscando ${qty} dispositivos (paginação automática)`, 'info', { qty, maxPageSize: FLASHMAN_MAX_PAGE_SIZE });
+
     const headers = await getAuthHeaders();
-    const response = await flashmanApi.get('/api/v2/devices/views/natural', {
-      headers, params: {
-        'pagination[pageSize]': qty,
-        'pagination[currentPage]': 1,
-        'sorting[sortBy]': 'lastInform',
-        'sorting[sortOrder]': 'desc'
+    const totalPages = Math.ceil(qty / FLASHMAN_MAX_PAGE_SIZE);
+    let allDevices = [];
+
+    for (let page = 1; page <= totalPages; page++) {
+      const remaining = qty - allDevices.length;
+      const size = Math.min(remaining, FLASHMAN_MAX_PAGE_SIZE);
+
+      addLog('DEVICES', `Request página ${page}/${totalPages} (pageSize=${size})`, 'info', { page, totalPages, size });
+
+      const response = await flashmanApi.get('/api/v2/devices/views/natural', {
+        headers,
+        params: {
+          'pagination[pageSize]': size,
+          'pagination[currentPage]': page,
+          'sorting[sortBy]': 'lastInform',
+          'sorting[sortOrder]': 'desc'
+        }
+      });
+
+      const registers = response.data.registers || [];
+      allDevices = allDevices.concat(registers);
+
+      addLog('DEVICES', `Página ${page}/${totalPages} carregada — ${registers.length} dispositivos retornados`, 'info', {
+        page, totalPages, fetchedThisPage: registers.length, totalFetchedSoFar: allDevices.length
+      });
+
+      // Se retornou menos que o esperado, não há mais páginas
+      if (registers.length < size) {
+        addLog('DEVICES', `API retornou menos registros que o esperado — fim dos dados disponíveis`, 'warn', {
+          expected: size, received: registers.length, totalFetched: allDevices.length
+        });
+        break;
       }
+    }
+
+    addLog('DEVICES', `Total: ${allDevices.length} dispositivos carregados em ${totalPages} páginas`, 'success', {
+      requested: qty, fetched: allDevices.length, pagesUsed: Math.min(totalPages, Math.ceil(allDevices.length / FLASHMAN_MAX_PAGE_SIZE)),
+      sampleSNs: allDevices.slice(0, 5).map(d => d.serialNumber || d.sn || d._id || '?')
     });
-    const devices = response.data.registers || [];
-    addLog('DEVICES', `${devices.length} dispositivos carregados`, 'success', {
-      qty,
-      count: devices.length,
-      sampleSNs: devices.slice(0, 3).map(d => d.serialNumber || d.sn || d._id || '?')
-    });
-    res.json({ devices });
+
+    res.json({ devices: allDevices, totalFetched: allDevices.length, pagesUsed: totalPages });
   } catch (error) {
     if (error.response?.status === 401 || error.response?.status === 400) authToken = null;
     addLog('DEVICES', `Erro ao buscar dispositivos`, 'error', { qty, message: error.message, status: error.response?.status });
@@ -209,103 +237,26 @@ app.post('/api/update-channel', async (req, res) => {
 // ============================================================
 
 function getBestChannelsDeterministic(scanData) {
-  // 1. Canais ideais (2.4G apenas não sobrepostos; 5G inclui faixas limpas e DFS altas)
   const valid2G = [1, 6, 11];
-  const valid5G = [36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149];
-
-  // 2. Inicializa o "peso de interferência". Quanto menor a pontuação, melhor o canal.
-  const weights2G = { 1: 0, 6: 0, 11: 0 };
-  const weights5G = {};
-  valid5G.forEach(c => weights5G[c] = 0);
-
-  // 3. Função para calcular o peso do sinal (Interferência)
-  // Sinal -40 (Forte) gera peso 60. Sinal -90 (Fraco) gera peso 10.
-  const getSignalPenalty = (net) => {
-    const rssi = parseInt(net.rssi || net.signal || net.noise); // Busca a chave que a API devolver
-    if (isNaN(rssi) || rssi > 0) return 30; // Peso médio padrão caso o roteador não informe o RSSI
-    return Math.max(0, 100 + rssi); // Ex: 100 + (-70) = 30 pontos de penalidade
-  };
+  const counts2G = { 1: 0, 6: 0, 11: 0 };
+  const valid5G = [];
+  for (let i = 144; i >= 36; i -= 4) valid5G.push(i);
+  const counts5G = {};
+  valid5G.forEach(c => counts5G[c] = 0);
 
   scanData.forEach(net => {
-    const netChannel = parseInt(net.channel);
-    if (isNaN(netChannel)) return;
-
-    const penalty = getSignalPenalty(net);
-
-    // ==========================================
-    // 📡 Lógica 2.4 GHz (Cálculo de Sobreposição)
-    // ==========================================
-    if (netChannel >= 1 && netChannel <= 14) {
-      valid2G.forEach(candidate => {
-        const distance = Math.abs(netChannel - candidate);
-        // Penaliza canais próximos com base na distância de sobreposição
-        if (distance === 0) weights2G[candidate] += penalty;         // 100% de impacto
-        else if (distance === 1) weights2G[candidate] += penalty * 0.8; // 80% de impacto
-        else if (distance === 2) weights2G[candidate] += penalty * 0.6; // 60% de impacto
-        else if (distance === 3) weights2G[candidate] += penalty * 0.4; // 40% de impacto
-        else if (distance === 4) weights2G[candidate] += penalty * 0.2; // 20% de impacto
-      });
-    }
-
-    // ==========================================
-    // 🚀 Lógica 5 GHz (Cálculo de Largura de Banda)
-    // ==========================================
-    if (netChannel >= 36) {
-      // Tenta extrair a largura de banda (ex: "40MHz" -> 40)
-      let bw = 20;
-      if (net.bandwidth) {
-        const parsedBw = parseInt(net.bandwidth.replace(/[^0-9]/g, ''));
-        if (!isNaN(parsedBw)) bw = parsedBw;
-      }
-
-      // Aplica a penalidade no canal base da rede vizinha
-      if (weights5G.hasOwnProperty(netChannel)) {
-        weights5G[netChannel] += penalty;
-      }
-
-      // Se a rede for "larga" (40, 80, 160MHz), ela invade os canais adjacentes (de 4 em 4)
-      if (bw >= 40) {
-        if (weights5G.hasOwnProperty(netChannel + 4)) weights5G[netChannel + 4] += (penalty * 0.8);
-        if (weights5G.hasOwnProperty(netChannel - 4)) weights5G[netChannel - 4] += (penalty * 0.8);
-      }
-      if (bw >= 80) {
-        if (weights5G.hasOwnProperty(netChannel + 8)) weights5G[netChannel + 8] += (penalty * 0.5);
-        if (weights5G.hasOwnProperty(netChannel - 8)) weights5G[netChannel - 8] += (penalty * 0.5);
-      }
-    }
+    const ch = parseInt(net.channel);
+    if (valid2G.includes(ch)) counts2G[ch]++;
+    if (counts5G.hasOwnProperty(ch)) counts5G[ch]++;
   });
 
-  // 4. Encontra o canal com o MENOR peso (menos interferência) no 2.4G
-  let best2G = 1, minWeight2G = Infinity;
-  for (const ch in weights2G) {
-    if (weights2G[ch] < minWeight2G) {
-      minWeight2G = weights2G[ch];
-      best2G = ch;
-    }
-  }
+  let best2G = 1, min2G = Infinity;
+  for (const ch of valid2G) { if (counts2G[ch] < min2G) { min2G = counts2G[ch]; best2G = ch; } }
 
-  // 5. Encontra o canal com o MENOR peso no 5G
-  // Invertemos a ordem do array (usando reverse) para que o algoritmo DÊ PREFERÊNCIA aos canais
-  // mais altos (ex: 149, 149...) em caso de empate (peso igual a 0).
-  let best5G = 149, minWeight5G = Infinity; 
-  for (const ch of [...valid5G].reverse()) { 
-    if (weights5G[ch] < minWeight5G) {
-      minWeight5G = weights5G[ch];
-      best5G = ch;
-    }
-  }
+  let best5G = 36, min5G = Infinity;
+  for (const ch of valid5G) { if (counts5G[ch] < min5G) { min5G = counts5G[ch]; best5G = ch; if (min5G === 0) break; } }
 
-  // 6. Arredonda os números para os logs da interface ficarem legíveis
-  Object.keys(weights2G).forEach(k => weights2G[k] = Math.round(weights2G[k]));
-  Object.keys(weights5G).forEach(k => weights5G[k] = Math.round(weights5G[k]));
-
-  // Mantive a nomenclatura "counts2G/5G" no retorno para não quebrar a sua rota '/api/instant-recommend'
-  return { 
-    channel2G: String(best2G), 
-    channel5G: String(best5G), 
-    counts2G: weights2G, 
-    counts5G: weights5G 
-  };
+  return { channel2G: String(best2G), channel5G: String(best5G), counts2G, counts5G };
 }
 
 app.post('/api/instant-recommend', async (req, res) => {
@@ -352,7 +303,7 @@ app.post('/api/ai-recommend', async (req, res) => {
     const allChannels = scanData.map(net => net.channel).filter(c => c !== undefined && c !== null);
     const uniqueChannels = [...new Set(allChannels)].join(', ');
 
-    const prompt = `You are a Wi-Fi optimizer. Occupied channels: [${uniqueChannels}]. Rules: 2.4GHz channel must be 1-11. 5GHz channel must be 36-149. Choose the best channel for each band. Output format: 2G:X,5G:Y`;
+    const prompt = `You are a Wi-Fi optimizer. Occupied channels: [${uniqueChannels}]. Rules: 2.4GHz channel must be 1-11. 5GHz channel must be 36-144. Choose the best channel for each band. Output format: 2G:X,5G:Y`;
 
     addLog('AI', `Prompt enviado ao Ollama`, 'info', { prompt, uniqueChannels });
 
@@ -435,7 +386,6 @@ app.get('/logs', (req, res) => {
       <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0a0e1a; color: #e2e8f0; min-height: 100vh; }
-
         .topbar {
           background: #1e293b; border-bottom: 2px solid #334155; padding: 1rem 2rem;
           display: flex; align-items: center; justify-content: space-between; position: sticky; top: 0; z-index: 100;
@@ -444,14 +394,12 @@ app.get('/logs', (req, res) => {
         .topbar h1 span { color: #f59e0b; }
         .topbar a { color: #38bdf8; text-decoration: none; font-size: 0.9rem; }
         .topbar a:hover { text-decoration: underline; }
-
         .stats-bar {
           display: grid; grid-template-columns: repeat(5, 1fr); gap: 0.75rem;
           padding: 1.5rem 2rem; background: #111827; border-bottom: 1px solid #1e293b;
         }
         .stat-card {
-          background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 1rem;
-          text-align: center;
+          background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 1rem; text-align: center;
         }
         .stat-card .num { font-size: 2rem; font-weight: bold; }
         .stat-card .label { font-size: 0.75rem; color: #94a3b8; margin-top: 0.25rem; }
@@ -460,7 +408,6 @@ app.get('/logs', (req, res) => {
         .stat-card.info .num { color: #38bdf8; }
         .stat-card.warn .num { color: #f59e0b; }
         .stat-card.total .num { color: #e2e8f0; }
-
         .filters {
           padding: 1rem 2rem; background: #0f172a; border-bottom: 1px solid #1e293b;
           display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap;
@@ -471,41 +418,25 @@ app.get('/logs', (req, res) => {
           background: #1e293b; color: #e2e8f0; font-size: 0.85rem; min-width: 120px;
         }
         .filters input[type="text"] { min-width: 200px; }
-        .btn {
-          padding: 0.5rem 1rem; border-radius: 6px; border: none; font-size: 0.85rem;
-          cursor: pointer; font-weight: bold; color: #fff;
-        }
+        .btn { padding: 0.5rem 1rem; border-radius: 6px; border: none; font-size: 0.85rem; cursor: pointer; font-weight: bold; color: #fff; }
         .btn.refresh { background: #3b82f6; }
         .btn.clear { background: #ef4444; }
         .btn.clear:hover { background: #dc2626; }
         .btn.refresh:hover { background: #2563eb; }
         .btn.export { background: #10b981; }
         .btn.export:hover { background: #059669; }
-
-        .log-container {
-          padding: 1rem 2rem; max-height: calc(100vh - 240px); overflow-y: auto;
-        }
+        .log-container { padding: 1rem 2rem; max-height: calc(100vh - 240px); overflow-y: auto; }
         .log-container::-webkit-scrollbar { width: 8px; }
         .log-container::-webkit-scrollbar-track { background: #0f172a; }
         .log-container::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
-
         .log-entry {
           background: #1e293b; border: 1px solid #334155; border-radius: 8px;
           padding: 0.75rem 1rem; margin-bottom: 0.5rem; transition: all 0.2s;
         }
         .log-entry:hover { border-color: #475569; background: #233044; }
-
-        .log-header {
-          display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.4rem;
-        }
-        .log-id {
-          background: #334155; padding: 0.15rem 0.5rem; border-radius: 4px;
-          font-size: 0.7rem; font-weight: bold; color: #94a3b8;
-        }
-        .log-type-badge {
-          padding: 0.15rem 0.6rem; border-radius: 4px; font-size: 0.7rem;
-          font-weight: bold; letter-spacing: 0.5px;
-        }
+        .log-header { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.4rem; }
+        .log-id { background: #334155; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.7rem; font-weight: bold; color: #94a3b8; }
+        .log-type-badge { padding: 0.15rem 0.6rem; border-radius: 4px; font-size: 0.7rem; font-weight: bold; letter-spacing: 0.5px; }
         .log-type-badge.AUTH { background: #1e3a5f; color: #38bdf8; }
         .log-type-badge.DEVICES { background: #1e3a5f; color: #60a5fa; }
         .log-type-badge.SCAN { background: #312e81; color: #a78bfa; }
@@ -513,35 +444,22 @@ app.get('/logs', (req, res) => {
         .log-type-badge.AI { background: #4c1d95; color: #c084fc; }
         .log-type-badge.UPDATE { background: #064e3b; color: #6ee7b7; }
         .log-type-badge.SYSTEM { background: #334155; color: #94a3b8; }
-
-        .log-status-dot {
-          width: 8px; height: 8px; border-radius: 50%; display: inline-block;
-        }
+        .log-status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
         .log-status-dot.success { background: #10b981; }
         .log-status-dot.error { background: #ef4444; }
         .log-status-dot.info { background: #38bdf8; }
         .log-status-dot.warn { background: #f59e0b; }
-
         .log-time { font-size: 0.75rem; color: #64748b; }
         .log-detail { font-size: 0.9rem; color: #e2e8f0; }
-
-        .log-extra-toggle {
-          font-size: 0.75rem; color: #38bdf8; cursor: pointer; margin-top: 0.3rem;
-          user-select: none;
-        }
+        .log-extra-toggle { font-size: 0.75rem; color: #38bdf8; cursor: pointer; margin-top: 0.3rem; user-select: none; }
         .log-extra-toggle:hover { color: #7dd3fc; }
-
         .log-extra-content {
-          display: none; margin-top: 0.5rem; padding: 0.5rem;
-          background: #0f172a; border-radius: 6px; border: 1px solid #1e293b;
-          font-size: 0.75rem; color: #94a3b8; white-space: pre-wrap; word-break: break-all;
-          max-height: 200px; overflow-y: auto;
+          display: none; margin-top: 0.5rem; padding: 0.5rem; background: #0f172a;
+          border-radius: 6px; border: 1px solid #1e293b; font-size: 0.75rem; color: #94a3b8;
+          white-space: pre-wrap; word-break: break-all; max-height: 200px; overflow-y: auto;
         }
         .log-extra-content.open { display: block; }
-
-        .empty-state {
-          text-align: center; padding: 3rem; color: #64748b;
-        }
+        .empty-state { text-align: center; padding: 3rem; color: #64748b; }
         .empty-state .icon { font-size: 3rem; margin-bottom: 1rem; }
       </style>
     </head>
@@ -553,7 +471,6 @@ app.get('/logs', (req, res) => {
           <span style="color: #64748b; font-size: 0.8rem;" id="lastUpdate"></span>
         </div>
       </div>
-
       <div class="stats-bar" id="statsBar">
         <div class="stat-card total"><div class="num" id="statTotal">0</div><div class="label">Total</div></div>
         <div class="stat-card success"><div class="num" id="statSuccess">0</div><div class="label">Sucessos</div></div>
@@ -561,7 +478,6 @@ app.get('/logs', (req, res) => {
         <div class="stat-card info"><div class="num" id="statInfo">0</div><div class="label">Info</div></div>
         <div class="stat-card warn"><div class="num" id="statWarn">0</div><div class="label">Avisos</div></div>
       </div>
-
       <div class="filters">
         <label>Tipo</label>
         <select id="filterType" onchange="refreshLogs()">
@@ -574,7 +490,6 @@ app.get('/logs', (req, res) => {
           <option value="UPDATE">Update</option>
           <option value="SYSTEM">System</option>
         </select>
-
         <label>Status</label>
         <select id="filterStatus" onchange="refreshLogs()">
           <option value="">Todos</option>
@@ -583,25 +498,17 @@ app.get('/logs', (req, res) => {
           <option value="info">Info</option>
           <option value="warn">Aviso</option>
         </select>
-
         <label>Buscar</label>
         <input id="filterSearch" type="text" placeholder="Buscar nos logs..." oninput="refreshLogs()" />
-
         <button class="btn refresh" onclick="refreshLogs()">🔄 Atualizar</button>
         <button class="btn export" onclick="exportLogs()">📥 Exportar JSON</button>
         <button class="btn clear" onclick="clearLogs()">🗑️ Limpar Todos</button>
       </div>
-
       <div class="log-container" id="logContainer">
-        <div class="empty-state">
-          <div class="icon">📋</div>
-          Carregando logs...
-        </div>
+        <div class="empty-state"><div class="icon">📋</div>Carregando logs...</div>
       </div>
-
       <script>
         let currentLogs = [];
-
         function updateStats(logs) {
           document.getElementById('statTotal').textContent = logs.length;
           document.getElementById('statSuccess').textContent = logs.filter(l => l.status === 'success').length;
@@ -609,19 +516,12 @@ app.get('/logs', (req, res) => {
           document.getElementById('statInfo').textContent = logs.filter(l => l.status === 'info').length;
           document.getElementById('statWarn').textContent = logs.filter(l => l.status === 'warn').length;
         }
-
         function renderLogs(logs) {
           const container = document.getElementById('logContainer');
-          if (logs.length === 0) {
-            container.innerHTML = '<div class="empty-state"><div class="icon">📭</div>Nenhum log encontrado.</div>';
-            return;
-          }
-
+          if (logs.length === 0) { container.innerHTML = '<div class="empty-state"><div class="icon">📭</div>Nenhum log encontrado.</div>'; return; }
           container.innerHTML = logs.map(l => {
-            const extraStr = l.extra && Object.keys(l.extra).length > 0
-              ? JSON.stringify(l.extra, null, 2) : '';
+            const extraStr = l.extra && Object.keys(l.extra).length > 0 ? JSON.stringify(l.extra, null, 2) : '';
             const hasExtra = extraStr.length > 0;
-
             return '<div class="log-entry">'
               + '<div class="log-header">'
               + '<span class="log-id">#' + l.id + '</span>'
@@ -630,69 +530,38 @@ app.get('/logs', (req, res) => {
               + '<span class="log-time">' + l.timestampLocal + '</span>'
               + '</div>'
               + '<div class="log-detail">' + l.detail + '</div>'
-              + (hasExtra
-                ? '<div class="log-extra-toggle" onclick="toggleExtra(this)">▸ Detalhes (' + Object.keys(l.extra).length + ' campos)</div>'
-                  + '<div class="log-extra-content">' + extraStr + '</div>'
-                : '')
+              + (hasExtra ? '<div class="log-extra-toggle" onclick="toggleExtra(this)">▸ Detalhes (' + Object.keys(l.extra).length + ' campos)</div><div class="log-extra-content">' + extraStr + '</div>' : '')
               + '</div>';
           }).join('');
         }
-
-        function toggleExtra(el) {
-          const content = el.nextElementSibling;
-          const isOpen = content.classList.contains('open');
-          content.classList.toggle('open');
-          el.textContent = isOpen ? '▸ Detalhes' : '▾ Detalhes';
-        }
-
+        function toggleExtra(el) { const content = el.nextElementSibling; const isOpen = content.classList.contains('open'); content.classList.toggle('open'); el.textContent = isOpen ? '▸ Detalhes' : '▾ Detalhes'; }
         async function refreshLogs() {
           const type = document.getElementById('filterType').value;
           const status = document.getElementById('filterStatus').value;
           const search = document.getElementById('filterSearch').value;
-
           try {
             const params = new URLSearchParams();
             if (type) params.set('type', type);
             if (status) params.set('status', status);
             if (search) params.set('search', search);
             params.set('limit', '200');
-
             const res = await fetch('/api/logs?' + params.toString());
             const data = await res.json();
-
-            currentLogs = data.logs;
-            updateStats(data.logs);
-            renderLogs(data.logs);
+            currentLogs = data.logs; updateStats(data.logs); renderLogs(data.logs);
             document.getElementById('lastUpdate').textContent = 'Atualizado: ' + new Date().toLocaleTimeString('pt-BR');
-          } catch(e) {
-            document.getElementById('logContainer').innerHTML = '<div class="empty-state"><div class="icon">❌</div>Erro ao carregar logs: ' + e.message + '</div>';
-          }
+          } catch(e) { document.getElementById('logContainer').innerHTML = '<div class="empty-state"><div class="icon">❌</div>Erro ao carregar logs: ' + e.message + '</div>'; }
         }
-
         async function clearLogs() {
           if (!confirm('Tem certeza que deseja limpar TODOS os logs? Essa ação não pode ser desfeita.')) return;
-          try {
-            const res = await fetch('/api/logs', { method: 'DELETE' });
-            const data = await res.json();
-            alert('Logs limpos! ' + data.removed + ' entradas removidas.');
-            refreshLogs();
-          } catch(e) { alert('Erro: ' + e.message); }
+          try { const res = await fetch('/api/logs', { method: 'DELETE' }); const data = await res.json(); alert('Logs limpos! ' + data.removed + ' entradas removidas.'); refreshLogs(); } catch(e) { alert('Erro: ' + e.message); }
         }
-
         function exportLogs() {
           const data = JSON.stringify(currentLogs, null, 2);
           const blob = new Blob([data], { type: 'application/json' });
           const url = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = 'flashman_logs_' + new Date().toISOString().slice(0, 10) + '.json';
-          a.click();
-          URL.revokeObjectURL(url);
+          const a = document.createElement('a'); a.href = url; a.download = 'flashman_logs_' + new Date().toISOString().slice(0, 10) + '.json'; a.click(); URL.revokeObjectURL(url);
         }
-
-        // Auto-refresh every 5 seconds
         setInterval(refreshLogs, 5000);
-
         window.onload = refreshLogs;
       </script>
     </body>
@@ -735,6 +604,7 @@ app.get('/', (req, res) => {
         label { font-size: 0.85rem; color: #94a3b8; display: block; margin-bottom: 0.5rem; }
         .section-box { background: #0f172a; padding: 1.5rem; border-radius: 8px; border: 1px solid #334155; }
         .log-counter { font-size: 0.8rem; color: #64748b; margin-top: 0.5rem; }
+        .pagination-info { font-size: 0.8rem; color: #94a3b8; margin-top: 0.25rem; }
       </style>
     </head>
     <body>
@@ -745,7 +615,11 @@ app.get('/', (req, res) => {
         </h1>
         
         <div class="grid-3 mb-1">
-          <div><label>Qtd. Aparelhos</label><input id="qtyInput" type="number" value="10" min="1" max="1000" /></div>
+          <div>
+            <label>Qtd. de Aparelhos</label>
+            <input id="qtyInput" type="number" value="100" min="1" max="5000" />
+            <div class="pagination-info" id="paginationInfo"></div>
+          </div>
           <div><label>Selecionar da Lista</label><select id="devSel" disabled onchange="syncSN()"><option>Carregando...</option></select></div>
           <div><label>Ou digite o SN Manual</label><input id="snInput" type="text" placeholder="Ex: ZTEEQL4Q3B06071" /></div>
         </div>
@@ -769,9 +643,9 @@ app.get('/', (req, res) => {
             </div>
           </div>
           <div>
-            <label>Canal 5GHz (36 a 149)</label>
+            <label>Canal 5GHz (36 a 144)</label>
             <div class="grid-2" style="gap: 0.5rem;">
-              <input id="channel5G" type="number" placeholder="Ex: 100" min="36" max="149" />
+              <input id="channel5G" type="number" placeholder="Ex: 100" min="36" max="144" />
               <button class="apply" onclick="applyChannel('5G')">Aplicar 5G</button>
             </div>
           </div>
@@ -808,15 +682,19 @@ app.get('/', (req, res) => {
         async function loadDevices() {
           const sel = document.getElementById('devSel');
           const qty = document.getElementById('qtyInput').value || 10;
+          const pages = Math.ceil(qty / 50);
+          document.getElementById('paginationInfo').textContent = qty + ' dispositivos = ' + pages + ' páginas (50/página)';
           document.getElementById('btnInstant').disabled = true;
           document.getElementById('btnAI').disabled = true;
           document.getElementById('resultsSection').style.display = 'none';
-          sel.innerHTML = '<option>Carregando...</option>'; sel.disabled = true;
+          sel.innerHTML = '<option>Carregando ' + qty + ' em ' + pages + ' páginas...</option>'; sel.disabled = true;
           try {
-            showStatus('⏳ Buscando equipamentos...', 'warn');
+            showStatus('⏳ Buscando ' + qty + ' equipamentos (' + pages + ' páginas)...', 'warn');
             const res = await fetch('/api/devices?qty=' + qty);
             const data = await res.json(); if (!res.ok) throw new Error(data.error || 'Erro');
             const devs = data.devices || [];
+            const pagesUsed = data.pagesUsed || pages;
+            document.getElementById('paginationInfo').textContent = qty + ' solicitados → ' + devs.length + ' carregados em ' + pagesUsed + ' páginas';
             sel.innerHTML = '<option value="">-- Selecione (' + devs.length + ') --</option>';
             devs.forEach(d => {
               const sn = d.serialNumber || d.sn || d.deviceInfo?.serialNumber || d._id || d.macs?.[0];
@@ -910,7 +788,8 @@ app.get('/', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  addLog('SYSTEM', `Servidor iniciado na porta ${PORT}`, 'success', { port: PORT, nodeVersion: process.version });
+  addLog('SYSTEM', `Servidor iniciado na porta ${PORT}`, 'success', { port: PORT, nodeVersion: process.version, maxPageSize: FLASHMAN_MAX_PAGE_SIZE });
   console.log(`🚀 Servidor rodando em http://localhost:${PORT}`);
   console.log(`📋 Logs disponíveis em http://localhost:${PORT}/logs`);
+  console.log(`📄 Paginação automática: max ${FLASHMAN_MAX_PAGE_SIZE} por página`);
 });
