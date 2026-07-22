@@ -286,7 +286,7 @@ function getBestChannelsDeterministic(scanData) {
 
   // 5. Encontra o canal com o MENOR peso no 5G
   // Invertemos a ordem do array (usando reverse) para que o algoritmo DÊ PREFERÊNCIA aos canais
-  // mais altos (ex: 149, 144...) em caso de empate (peso igual a 0).
+  // mais altos (ex: 149, 149...) em caso de empate (peso igual a 0).
   let best5G = 149, minWeight5G = Infinity; 
   for (const ch of [...valid5G].reverse()) { 
     if (weights5G[ch] < minWeight5G) {
@@ -352,7 +352,7 @@ app.post('/api/ai-recommend', async (req, res) => {
     const allChannels = scanData.map(net => net.channel).filter(c => c !== undefined && c !== null);
     const uniqueChannels = [...new Set(allChannels)].join(', ');
 
-    const prompt = `You are a Wi-Fi optimizer. Occupied channels: [${uniqueChannels}]. Rules: 2.4GHz channel must be 1-11. 5GHz channel must be 36-144. Choose the best channel for each band. Output format: 2G:X,5G:Y`;
+    const prompt = `You are a Wi-Fi optimizer. Occupied channels: [${uniqueChannels}]. Rules: 2.4GHz channel must be 1-11. 5GHz channel must be 36-149. Choose the best channel for each band. Output format: 2G:X,5G:Y`;
 
     addLog('AI', `Prompt enviado ao Ollama`, 'info', { prompt, uniqueChannels });
 
@@ -769,9 +769,9 @@ app.get('/', (req, res) => {
             </div>
           </div>
           <div>
-            <label>Canal 5GHz (36 a 144)</label>
+            <label>Canal 5GHz (36 a 149)</label>
             <div class="grid-2" style="gap: 0.5rem;">
-              <input id="channel5G" type="number" placeholder="Ex: 100" min="36" max="144" />
+              <input id="channel5G" type="number" placeholder="Ex: 100" min="36" max="149" />
               <button class="apply" onclick="applyChannel('5G')">Aplicar 5G</button>
             </div>
           </div>
