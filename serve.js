@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const https = require('https');
@@ -11,9 +12,14 @@ app.use(express.json());
 const PORT = 3000;
 dns.setDefaultResultOrder('ipv4first');
 
-const API_BASE_URL = 'https://flashman.olvtelecom.com.br';
-const CLIENT_ID = 'REDACTED';
-const CLIENT_SECRET = 'REDACTED';
+const API_BASE_URL = process.env.FLASHMAN_API_BASE_URL || 'https://flashman.olvtelecom.com.br';
+const CLIENT_ID = process.env.FLASHMAN_CLIENT_ID;
+const CLIENT_SECRET = process.env.FLASHMAN_CLIENT_SECRET;
+
+if (!CLIENT_ID || !CLIENT_SECRET) {
+  console.error('ERRO: Defina FLASHMAN_CLIENT_ID e FLASHMAN_CLIENT_SECRET (veja .env.example)');
+  process.exit(1);
+}
 
 const LOG_FILE = path.join(__dirname, 'flashman_logs.json');
 const FLASHMAN_MAX_PAGE_SIZE = 50;

@@ -1,16 +1,18 @@
 {
-  "name": "scan_wifi_acs",
+  "name": "scan-wifi-acs",
   "version": "1.0.0",
-  "description": "",
+  "description": "Integração com a API Flashman (ACS) com logs locais e análise via Ollama",
   "main": "serve.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node serve.js",
+    "dev": "node --watch serve.js"
   },
   "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "author": "Rodolfo Franco (FrancosCorporation)",
+  "license": "MIT",
   "dependencies": {
     "axios": "^1.18.1",
+    "dotenv": "^16.4.5",
     "express": "^5.2.1"
   }
 }
