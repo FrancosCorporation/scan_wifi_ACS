@@ -5,14 +5,20 @@
   "main": "serve.js",
   "scripts": {
     "start": "node serve.js",
-    "dev": "node --watch serve.js"
+    "dev": "node --watch serve.js",
+    "check": "node --check serve.js"
   },
   "keywords": [],
   "author": "Rodolfo Franco (FrancosCorporation)",
   "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
   "dependencies": {
     "axios": "^1.18.1",
     "dotenv": "^16.4.5",
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.7.1",
+    "helmet": "^8.3.0"
   }
 }

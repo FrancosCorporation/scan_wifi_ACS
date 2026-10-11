@@ -5,53 +5,182 @@ const https = require('https');
 const dns = require('dns');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
+const helmet = require('helmet');
+const { rateLimit } = require('express-rate-limit');
 
 const app = express();
-app.use(express.json());
+const PORT = Number(process.env.PORT || 3000);
+const HOST = process.env.HOST || '127.0.0.1';
+const TRUST_PROXY = process.env.TRUST_PROXY;
+if (TRUST_PROXY) app.set('trust proxy', TRUST_PROXY);
+const MAX_LOG_ENTRIES = 5000;
+const LOG_FILE = process.env.LOG_FILE || path.join(__dirname, 'flashman_logs.json');
+const AUDIT_FILE = process.env.AUDIT_FILE || path.join(__dirname, 'flashman_audit.jsonl');
+const LOG_ARCHIVE_DIR = process.env.LOG_ARCHIVE_DIR || path.join(__dirname, 'log_archive');
+const API_TOKEN = (process.env.API_TOKEN || '').trim();
+const API_TOKEN_BUFFER = Buffer.from(API_TOKEN, 'utf8');
 
-const PORT = 3000;
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
+  console.error('ERRO: PORT deve ser um inteiro entre 1 e 65535');
+  process.exit(1);
+}
+if (API_TOKEN_BUFFER.length < 32) {
+  console.error('ERRO: Defina API_TOKEN com pelo menos 32 bytes aleatórios (veja .env.example)');
+  process.exit(1);
+}
+
+const cspNonce = (req, res, next) => {
+  res.locals.cspNonce = crypto.randomBytes(32).toString('hex');
+  next();
+};
+app.use(cspNonce);
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      baseUri: ["'self'"],
+      fontSrc: ["'self'", 'https:', 'data:'],
+      formAction: ["'self'"],
+      frameAncestors: ["'none'"],
+      imgSrc: ["'self'", 'data:'],
+      objectSrc: ["'none'"],
+      scriptSrc: ["'self'", (req, res) => `'nonce-${res.locals.cspNonce}'`],
+      scriptSrcAttr: ["'none'"],
+      styleSrc: ["'self'", (req, res) => `'nonce-${res.locals.cspNonce}'`],
+      styleSrcAttr: ["'unsafe-inline'"],
+      connectSrc: ["'self'"],
+      upgradeInsecureRequests: process.env.NODE_ENV === 'production' ? [] : null,
+    },
+  },
+}));
+
+const apiRateLimit = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 60,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Limite de requisições atingido. Aguarde um minuto e tente novamente.' },
+});
+const flashmanRateLimit = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 10,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Limite de operações Flashman atingido. Aguarde um minuto.' },
+});
+const ollamaRateLimit = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 5,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Limite de consultas à IA atingido. Aguarde um minuto.' },
+});
+const healthRateLimit = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 30,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+});
+function noStore(_req, res, next) {
+  res.set('Cache-Control', 'no-store');
+  next();
+}
+
+function requireApiToken(req, res, next) {
+  const authorization = req.get('authorization') || '';
+  const match = /^Bearer\s+(.+)$/i.exec(authorization);
+  if (!match) return res.status(401).json({ error: 'Autenticação necessária.' });
+  const supplied = Buffer.from(match[1], 'utf8');
+  if (supplied.length !== API_TOKEN_BUFFER.length || !crypto.timingSafeEqual(supplied, API_TOKEN_BUFFER)) {
+    return res.status(401).json({ error: 'Token inválido.' });
+  }
+  return next();
+}
+
+app.use('/api', noStore, apiRateLimit, requireApiToken);
+app.use('/api/devices', flashmanRateLimit);
+app.use('/api/scan', flashmanRateLimit);
+app.use('/api/update-channel', flashmanRateLimit);
+app.use('/api/ai-recommend', ollamaRateLimit);
+app.use(express.json({ limit: '100kb' }));
+
 dns.setDefaultResultOrder('ipv4first');
 
 const API_BASE_URL = process.env.FLASHMAN_API_BASE_URL || 'https://flashman.olvtelecom.com.br';
 const CLIENT_ID = process.env.FLASHMAN_CLIENT_ID;
 const CLIENT_SECRET = process.env.FLASHMAN_CLIENT_SECRET;
+let flashmanBaseUrl;
+
+try {
+  const parsedBaseUrl = new URL(API_BASE_URL);
+  if (parsedBaseUrl.protocol !== 'https:' || parsedBaseUrl.username || parsedBaseUrl.password || parsedBaseUrl.search || parsedBaseUrl.hash) {
+    throw new Error('FLASHMAN_API_BASE_URL deve ser uma URL HTTPS sem credenciais, query ou fragmento');
+  }
+  flashmanBaseUrl = parsedBaseUrl.toString().replace(/\/$/, '');
+} catch (error) {
+  console.error(`ERRO: ${error.message}`);
+  process.exit(1);
+}
+
+let ollamaBaseUrl = process.env.OLLAMA_URL || 'http://127.0.0.1:11434';
+try {
+  const parsedOllamaUrl = new URL(ollamaBaseUrl);
+  if (!['http:', 'https:'].includes(parsedOllamaUrl.protocol) || parsedOllamaUrl.username || parsedOllamaUrl.password || parsedOllamaUrl.search || parsedOllamaUrl.hash) {
+    throw new Error('OLLAMA_URL deve ser uma URL HTTP(S) sem credenciais, query ou fragmento');
+  }
+  ollamaBaseUrl = parsedOllamaUrl.toString().replace(/\/$/, '');
+} catch (error) {
+  console.error(`ERRO: ${error.message}`);
+  process.exit(1);
+}
 
 if (!CLIENT_ID || !CLIENT_SECRET) {
   console.error('ERRO: Defina FLASHMAN_CLIENT_ID e FLASHMAN_CLIENT_SECRET (veja .env.example)');
   process.exit(1);
 }
 
-const LOG_FILE = path.join(__dirname, 'flashman_logs.json');
 const FLASHMAN_MAX_PAGE_SIZE = 50;
+const SERIAL_NUMBER_PATTERN = /^[A-Za-z0-9-]{6,32}$/;
 
 // ============================================================
 // 📝 SISTEMA DE LOGS
 // ============================================================
 
 let logs = [];
+let nextLogId = 1;
 
 function loadLogsFromFile() {
   try {
     if (fs.existsSync(LOG_FILE)) {
       const raw = fs.readFileSync(LOG_FILE, 'utf8');
-      logs = JSON.parse(raw);
+      const stored = JSON.parse(raw);
+      logs = Array.isArray(stored) ? stored.slice(-MAX_LOG_ENTRIES) : [];
+      nextLogId = logs.reduce((max, entry) => Math.max(max, Number(entry.id) || 0), 0) + 1;
     }
   } catch (e) {
     logs = [];
+    nextLogId = 1;
   }
 }
 
 function saveLogsToFile() {
+  const tempFile = `${LOG_FILE}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
   try {
-    fs.writeFileSync(LOG_FILE, JSON.stringify(logs, null, 2), 'utf8');
+    fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+    fs.writeFileSync(tempFile, JSON.stringify(logs, null, 2), { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    fs.renameSync(tempFile, LOG_FILE);
+    return true;
   } catch (e) {
-    console.error('Erro salvando logs em arquivo:', e.message);
+    try { fs.unlinkSync(tempFile); } catch {}
+    console.error('Erro salvando logs em arquivo:', e.code || e.message);
+    return false;
   }
 }
 
 function addLog(type, detail, status, extra = {}) {
   const entry = {
-    id: logs.length + 1,
+    id: nextLogId++,
     timestamp: new Date().toISOString(),
     timestampLocal: new Date().toLocaleString('pt-BR'),
     type,
@@ -60,6 +189,7 @@ function addLog(type, detail, status, extra = {}) {
     extra
   };
   logs.push(entry);
+  if (logs.length > MAX_LOG_ENTRIES) logs.splice(0, logs.length - MAX_LOG_ENTRIES);
   saveLogsToFile();
   console.log(`[LOG #${entry.id}] ${type} | ${status} | ${detail}`);
   return entry;
@@ -67,47 +197,131 @@ function addLog(type, detail, status, extra = {}) {
 
 loadLogsFromFile();
 
+function appendAudit(event, details = {}) {
+  let fd;
+  try {
+    fs.mkdirSync(path.dirname(AUDIT_FILE), { recursive: true, mode: 0o700 });
+    fd = fs.openSync(AUDIT_FILE, 'a', 0o600);
+    fs.fchmodSync(fd, 0o600);
+    fs.writeFileSync(fd, `${JSON.stringify({ timestamp: new Date().toISOString(), event, ...details })}\n`, { encoding: 'utf8' });
+    fs.closeSync(fd);
+    fd = undefined;
+    return true;
+  } catch (error) {
+    console.error('Erro gravando auditoria:', error.code || error.message);
+    return false;
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
+}
+
+function writeLogsArchive(entries) {
+  fs.mkdirSync(LOG_ARCHIVE_DIR, { recursive: true, mode: 0o700 });
+  fs.chmodSync(LOG_ARCHIVE_DIR, 0o700);
+  const archiveName = `flashman_logs_${new Date().toISOString().replace(/[:.]/g, '-')}_${crypto.randomBytes(4).toString('hex')}.json`;
+  const archivePath = path.join(LOG_ARCHIVE_DIR, archiveName);
+  fs.writeFileSync(archivePath, JSON.stringify(entries, null, 2), { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+  return archiveName;
+}
+
 // ============================================================
 // 🔑 AUTENTICAÇÃO OAUTH2
 // ============================================================
 
 const flashmanApi = axios.create({
-  baseURL: API_BASE_URL,
-  timeout: 30000,
-  httpsAgent: new https.Agent({ rejectUnauthorized: false, family: 4 }),
+  baseURL: flashmanBaseUrl,
+  timeout: 15000,
+  maxRedirects: 0,
+  httpsAgent: new https.Agent({
+    family: 4,
+    ...(process.env.FLASHMAN_CA_FILE ? { ca: fs.readFileSync(path.resolve(process.env.FLASHMAN_CA_FILE)) } : {}),
+  }),
   headers: { 'Accept': 'application/json' }
 });
 
 const ollamaApi = axios.create({
-  baseURL: 'http://localhost:11434',
+  baseURL: ollamaBaseUrl,
   timeout: 300000
 });
 
 let authToken = null;
+let authTokenExpiresAt = 0;
+let authTokenPromise = null;
+let authRetryAt = 0;
+let authGeneration = 0;
+const AUTH_FAILURE_BACKOFF_MS = 30_000;
+
+function invalidateAuthToken() {
+  authToken = null;
+  authTokenExpiresAt = 0;
+  authTokenPromise = null;
+  authGeneration++;
+}
+
+function authUnavailableError() {
+  const error = new Error('Autenticação Flashman temporariamente indisponível.');
+  error.code = 'AUTH_UNAVAILABLE';
+  error.retryAfterSeconds = Math.max(1, Math.ceil((authRetryAt - Date.now()) / 1000));
+  return error;
+}
+
+flashmanApi.interceptors.response.use(
+  (response) => {
+    if (response.status === 401 && !String(response.config?.url || '').includes('/token/oauth')) invalidateAuthToken();
+    return response;
+  },
+  (error) => {
+    if (error.response?.status === 401 && !String(error.config?.url || '').includes('/token/oauth')) invalidateAuthToken();
+    return Promise.reject(error);
+  }
+);
 
 async function getAccessToken() {
-  if (authToken) return authToken;
-  const params = new URLSearchParams();
-  params.append('grant_type', 'client_credentials');
-  params.append('client_id', CLIENT_ID);
-  params.append('client_secret', CLIENT_SECRET);
+  if (authToken && authTokenExpiresAt > Date.now()) return authToken;
+  if (authTokenPromise) return authTokenPromise;
+  if (authRetryAt > Date.now()) throw authUnavailableError();
 
-  try {
-    addLog('AUTH', 'Iniciando autenticação OAuth2', 'info');
-    const response = await flashmanApi.post('/api/v2/token/oauth', params.toString(), {
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-    });
-    authToken = response.data.access_token || response.data.token || response.data.accessToken;
-    if (!authToken) {
-      addLog('AUTH', 'Token não encontrado na resposta', 'error', { responseKeys: Object.keys(response.data) });
-      throw new Error('Token não encontrado');
+  const generation = authGeneration;
+  const pending = (async () => {
+    const params = new URLSearchParams();
+    params.append('grant_type', 'client_credentials');
+    params.append('client_id', CLIENT_ID);
+    params.append('client_secret', CLIENT_SECRET);
+    try {
+      addLog('AUTH', 'Iniciando autenticação OAuth2', 'info');
+      const response = await flashmanApi.post('/api/v2/token/oauth', params.toString(), {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+      });
+      if (generation !== authGeneration) throw new Error('Credencial invalidada durante a autenticação.');
+      const token = response.data.access_token || response.data.token || response.data.accessToken;
+      if (typeof token !== 'string' || !token.trim()) {
+        addLog('AUTH', 'Token não encontrado na resposta OAuth2', 'error', { responseKeys: Object.keys(response.data || {}) });
+        throw new Error('Token não encontrado');
+      }
+      authToken = token;
+      const expiresIn = Number(response.data.expires_in);
+      const lifetimeMs = Number.isFinite(expiresIn) && expiresIn > 0 ? expiresIn * 1000 : 5 * 60 * 1000;
+      const refreshSkewMs = Math.min(60_000, Math.max(5_000, lifetimeMs / 10));
+      authTokenExpiresAt = Date.now() + Math.max(0, lifetimeMs - refreshSkewMs);
+      authRetryAt = 0;
+      addLog('AUTH', 'Autenticação OAuth2 realizada com sucesso', 'success');
+      return authToken;
+    } catch (error) {
+      if (generation === authGeneration) {
+        authToken = null;
+        authTokenExpiresAt = 0;
+        authRetryAt = Date.now() + AUTH_FAILURE_BACKOFF_MS;
+      }
+      addLog('AUTH', 'Falha na autenticação OAuth2', 'error', { status: error.response?.status, errorCode: error.code || 'AUTH_ERROR' });
+      throw authUnavailableError();
+    } finally {
+      if (authTokenPromise === pending) authTokenPromise = null;
     }
-    addLog('AUTH', 'Autenticação OAuth2 realizada com sucesso', 'success', { tokenPrefix: authToken.substring(0, 10) + '...' });
-    return authToken;
-  } catch (error) {
-    addLog('AUTH', 'Falha na autenticação OAuth2', 'error', { message: error.message, status: error.response?.status });
-    throw new Error('Falha na autenticação.');
-  }
+  })();
+  authTokenPromise = pending;
+  return pending;
 }
 
 async function getAuthHeaders() {
@@ -115,12 +329,45 @@ async function getAuthHeaders() {
   return { 'Accept': 'application/json', 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` };
 }
 
+app.get('/health', noStore, healthRateLimit, async (_req, res) => {
+  let ollama = 'unavailable';
+  try {
+    const response = await ollamaApi.get('/api/tags', { timeout: 1500, maxRedirects: 0, validateStatus: () => true });
+    if (response.status >= 200 && response.status < 300) ollama = 'ok';
+  } catch {}
+
+  const flashmanAuth = authToken && authTokenExpiresAt > Date.now()
+    ? 'valid'
+    : (authRetryAt > Date.now() ? 'backoff' : 'not_checked');
+  const degraded = ollama !== 'ok' || flashmanAuth === 'backoff';
+  res.status(200).json({
+    status: degraded ? 'degraded' : 'ok',
+    services: { app: 'ok', ollama, flashmanAuth },
+    uptimeSeconds: Math.round(process.uptime()),
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.get('/api/auth/status', (_req, res) => {
+  res.json({ authenticated: true });
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  invalidateAuthToken();
+  authRetryAt = 0;
+  appendAudit('flashman_oauth_cache_cleared', { ip: req.ip });
+  res.json({ success: true, message: 'A próxima operação autenticará novamente na Flashman.' });
+});
+
 // ============================================================
 // 📡 ROTAS DA API FLASHMAN
 // ============================================================
 
 app.get('/api/devices', async (req, res) => {
-  const qty = parseInt(req.query.qty) || 10;
+  const qty = req.query.qty === undefined ? 10 : Number(req.query.qty);
+  if (!Number.isInteger(qty) || qty < 1 || qty > 5000) {
+    return res.status(400).json({ error: 'A quantidade deve ser um inteiro entre 1 e 5000.' });
+  }
   try {
     addLog('DEVICES', `Buscando ${qty} dispositivos (paginação automática)`, 'info', { qty, maxPageSize: FLASHMAN_MAX_PAGE_SIZE });
 
@@ -167,28 +414,33 @@ app.get('/api/devices', async (req, res) => {
 
     res.json({ devices: allDevices, totalFetched: allDevices.length, pagesUsed: totalPages });
   } catch (error) {
-    if (error.response?.status === 401 || error.response?.status === 400) authToken = null;
-    addLog('DEVICES', `Erro ao buscar dispositivos`, 'error', { qty, message: error.message, status: error.response?.status });
-    res.status(error.response?.status || 500).json({ error: error.response?.data?.message || error.message });
+    if (error.retryAfterSeconds) res.set('Retry-After', String(error.retryAfterSeconds));
+    addLog('DEVICES', 'Erro ao buscar dispositivos', 'error', { qty, errorCode: error.code || 'FLASHMAN_ERROR', status: error.response?.status });
+    res.status(error.code === 'AUTH_UNAVAILABLE' ? 503 : 502).json({
+      error: error.code === 'AUTH_UNAVAILABLE' ? 'Autenticação Flashman temporariamente indisponível.' : 'Não foi possível consultar os dispositivos Flashman.',
+    });
   }
 });
 
 app.get('/api/scan/:sn', async (req, res) => {
   const { sn } = req.params;
-  if (!sn || sn.length < 5) {
-    addLog('SCAN', `SN inválido recebido: "${sn}"`, 'error', { sn });
+  if (typeof sn !== 'string' || !SERIAL_NUMBER_PATTERN.test(sn)) {
+    addLog('SCAN', 'SN inválido recebido', 'error');
     return res.status(400).json({ error: 'SN inválido.' });
   }
   try {
     addLog('SCAN', `Iniciando scan de redes vizinhas para SN: ${sn}`, 'info', { sn });
     const headers = await getAuthHeaders();
-    await flashmanApi.post(`/api/v2/devices/${sn}/diagnostics/neighbor/start`, {}, { headers, validateStatus: () => true });
+    const encodedSn = encodeURIComponent(sn);
+    const startResponse = await flashmanApi.post(`/api/v2/devices/${encodedSn}/diagnostics/neighbor/start`, {}, { headers });
+    if (startResponse.status < 200 || startResponse.status >= 300) throw new Error('Falha ao iniciar o diagnóstico Flashman.');
 
     addLog('SCAN', `Scan iniciado, aguardando resultado... (SN: ${sn})`, 'info', { sn });
 
     const maxAttempts = 30;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      const stateResp = await flashmanApi.get(`/api/v2/devices/${sn}/diagnostics/neighbor/state`, { headers, validateStatus: () => true });
+      const stateResp = await flashmanApi.get(`/api/v2/devices/${encodedSn}/diagnostics/neighbor/state`, { headers, validateStatus: (status) => status < 500 });
+      if (stateResp.status === 401) throw new Error('Autenticação Flashman expirada.');
       if (stateResp.status === 200 && Array.isArray(stateResp.data) && stateResp.data.length > 0) {
         const channelList = stateResp.data.map(n => n.channel).filter(Boolean);
         addLog('SCAN', `Scan concluído com sucesso! ${stateResp.data.length} redes encontradas`, 'success', {
@@ -205,36 +457,48 @@ app.get('/api/scan/:sn', async (req, res) => {
     addLog('SCAN', `Scan expirou após ${maxAttempts * 2}s para SN: ${sn}`, 'error', { sn, maxAttempts, timeoutSeconds: maxAttempts * 2 });
     res.status(408).json({ error: 'Tempo esgotado.' });
   } catch (error) {
-    addLog('SCAN', `Erro no scan para SN: ${sn}`, 'error', { sn, message: error.message });
-    res.status(500).json({ error: error.message });
+    if (error.retryAfterSeconds) res.set('Retry-After', String(error.retryAfterSeconds));
+    addLog('SCAN', 'Erro ao executar o scan Flashman', 'error', { sn, errorCode: error.code || 'FLASHMAN_ERROR', status: error.response?.status });
+    res.status(error.code === 'AUTH_UNAVAILABLE' ? 503 : 502).json({
+      error: error.code === 'AUTH_UNAVAILABLE' ? 'Autenticação Flashman temporariamente indisponível.' : 'Não foi possível concluir o scan Flashman.',
+    });
   }
 });
 
 app.post('/api/update-channel', async (req, res) => {
-  const { sn, band, channel } = req.body;
-  if (!sn || !band || !channel) {
-    addLog('UPDATE', `Dados incompletos para atualização de canal`, 'error', { sn, band, channel });
-    return res.status(400).json({ error: 'Dados incompletos.' });
+  const { sn, band, channel } = req.body || {};
+  const numericChannel = Number(channel);
+  if (typeof sn !== 'string' || !SERIAL_NUMBER_PATTERN.test(sn) || !['2G', '5G'].includes(band) || !Number.isInteger(numericChannel)) {
+    addLog('UPDATE', 'Dados inválidos para atualização de canal', 'error');
+    return res.status(400).json({ error: 'Informe um SN, banda e canal válidos.' });
+  }
+  if ((band === '2G' && (numericChannel < 1 || numericChannel > 11)) || (band === '5G' && (numericChannel < 36 || numericChannel > 144))) {
+    return res.status(400).json({ error: 'Canal fora do intervalo permitido para a banda selecionada.' });
+  }
+  const encodedSn = encodeURIComponent(sn);
+  if (!appendAudit('router_channel_update_requested', { ip: req.ip, sn, band, channel: numericChannel })) {
+    return res.status(503).json({ error: 'Auditoria indisponível; nenhuma alteração foi enviada ao roteador.' });
   }
   try {
-    addLog('UPDATE', `Aplicando canal ${channel} na banda ${band} para SN: ${sn}`, 'info', { sn, band, channel });
+    addLog('UPDATE', `Aplicando canal ${numericChannel} na banda ${band} para SN: ${sn}`, 'info', { sn, band, channel: numericChannel });
     const headers = await getAuthHeaders();
     const instancePath = band === '2G' ? '1' : '5';
     const payload = [{
       "parameter": `InternetGatewayDevice.LANDevice.1.WLANConfiguration.${instancePath}.Channel`,
-      "value": parseInt(channel),
+      "value": numericChannel,
       "type": "xsd:unsignedInt"
     }];
-    const flashResp = await flashmanApi.post(`/api/v2/devices/${sn}/parameters/update`, payload, { headers });
-    addLog('UPDATE', `Canal ${channel} (${band}) aplicado com sucesso no SN: ${sn}`, 'success', {
-      sn, band, channel, flashmanResponse: flashResp.data
-    });
-    res.json({ success: true, flashmanResponse: flashResp.data });
+    const flashResp = await flashmanApi.post(`/api/v2/devices/${encodedSn}/parameters/update`, payload, { headers });
+    appendAudit('router_channel_update_succeeded', { ip: req.ip, sn, band, channel: numericChannel, status: flashResp.status });
+    addLog('UPDATE', `Canal ${numericChannel} (${band}) aplicado com sucesso no SN: ${sn}`, 'success', { sn, band, channel: numericChannel });
+    res.json({ success: true });
   } catch (error) {
-    addLog('UPDATE', `Erro ao aplicar canal ${channel} (${band}) no SN: ${sn}`, 'error', {
-      sn, band, channel, message: error.message, flashmanError: error.response?.data
+    appendAudit('router_channel_update_failed', { ip: req.ip, sn, band, channel: numericChannel, status: error.response?.status, errorCode: error.code || 'FLASHMAN_ERROR' });
+    if (error.retryAfterSeconds) res.set('Retry-After', String(error.retryAfterSeconds));
+    addLog('UPDATE', `Falha ao aplicar canal ${numericChannel} (${band}) no roteador`, 'error', { sn, band, channel: numericChannel, status: error.response?.status, errorCode: error.code || 'FLASHMAN_ERROR' });
+    res.status(error.code === 'AUTH_UNAVAILABLE' ? 503 : 502).json({
+      error: error.code === 'AUTH_UNAVAILABLE' ? 'Autenticação Flashman temporariamente indisponível.' : 'Não foi possível alterar o canal do roteador.',
     });
-    res.status(500).json({ error: error.response?.data || error.message });
   }
 });
 
@@ -265,11 +529,17 @@ function getBestChannelsDeterministic(scanData) {
   return { channel2G: String(best2G), channel5G: String(best5G), counts2G, counts5G };
 }
 
+function validScanData(scanData) {
+  return Array.isArray(scanData) && scanData.length > 0 && scanData.length <= 500 &&
+    scanData.every((network) => network && typeof network === 'object' &&
+      Number.isInteger(Number(network.channel)) && Number(network.channel) >= 1 && Number(network.channel) <= 196);
+}
+
 app.post('/api/instant-recommend', async (req, res) => {
-  const { scanData } = req.body;
-  if (!scanData || scanData.length === 0) {
+  const scanData = req.body?.scanData;
+  if (!validScanData(scanData)) {
     addLog('INSTANT', `Scan data vazio na recomendação instantânea`, 'error');
-    return res.status(400).json({ error: 'Escanee primeiro.' });
+    return res.status(400).json({ error: 'Envie entre 1 e 500 redes com canais válidos.' });
   }
   try {
     const startTime = Date.now();
@@ -291,16 +561,16 @@ app.post('/api/instant-recommend', async (req, res) => {
       raw: `Calculado pelo algoritmo do servidor em ${elapsed}ms. Redes analisadas: ${scanData.length}. Contagens 2G: ${JSON.stringify(result.counts2G)}. Contagens 5G (top 5): ${JSON.stringify(Object.entries(result.counts5G).sort((a, b) => b[1] - a[1]).slice(0, 5))}`
     });
   } catch (error) {
-    addLog('INSTANT', `Erro na recomendação instantânea`, 'error', { message: error.message });
-    res.status(500).json({ error: error.message });
+    addLog('INSTANT', 'Erro na recomendação instantânea', 'error', { errorCode: error.code || 'CALCULATION_ERROR' });
+    res.status(500).json({ error: 'Não foi possível calcular a recomendação.' });
   }
 });
 
 app.post('/api/ai-recommend', async (req, res) => {
-  const { scanData } = req.body;
-  if (!scanData || scanData.length === 0) {
+  const scanData = req.body?.scanData;
+  if (!validScanData(scanData)) {
     addLog('AI', `Scan data vazio na recomendação IA`, 'error');
-    return res.status(400).json({ error: 'Escanee primeiro.' });
+    return res.status(400).json({ error: 'Envie entre 1 e 500 redes com canais válidos.' });
   }
   try {
     const startTime = Date.now();
@@ -311,8 +581,6 @@ app.post('/api/ai-recommend', async (req, res) => {
 
     const prompt = `You are a Wi-Fi optimizer. Occupied channels: [${uniqueChannels}]. Rules: 2.4GHz channel must be 1-11. 5GHz channel must be 36-144. Choose the best channel for each band. Output format: 2G:X,5G:Y`;
 
-    addLog('AI', `Prompt enviado ao Ollama`, 'info', { prompt, uniqueChannels });
-
     const ollamaResp = await ollamaApi.post('/api/generate', {
       model: 'qwen3.5:0.8b',
       prompt: prompt,
@@ -321,26 +589,33 @@ app.post('/api/ai-recommend', async (req, res) => {
 
     const elapsed = Date.now() - startTime;
     const iaText = ollamaResp.data?.response || '';
-    addLog('AI', `IA respondeu`, 'info', { rawResponse: iaText, elapsedMs: elapsed, model: 'qwen3.5:0.8b' });
+    addLog('AI', 'IA respondeu', 'info', { elapsedMs: elapsed, model: 'qwen3.5:0.8b' });
 
-    const match2G = iaText.match(/2G[:\s]*([0-9]+)/i);
-    const match5G = iaText.match(/5G[:\s]*([0-9]+)/i);
+    const match2G = iaText.match(/2G\s*:\s*(-?\d+(?:\.\d+)?)/i);
+    const match5G = iaText.match(/5G\s*:\s*(-?\d+(?:\.\d+)?)/i);
 
     if (!match2G || !match5G) {
-      addLog('AI', `IA não retornou no formato esperado`, 'error', { rawResponse: iaText, elapsedMs: elapsed });
-      return res.status(400).json({ error: `IA não retornou no formato esperado. Resposta: "${iaText}"` });
+      addLog('AI', 'IA não retornou no formato esperado', 'error', { elapsedMs: elapsed });
+      return res.status(502).json({ error: 'A IA não retornou uma recomendação válida.' });
     }
 
     const channel2G = match2G[1];
     const channel5G = match5G[1];
+    const numericChannel2G = Number(channel2G);
+    const numericChannel5G = Number(channel5G);
+    if (!Number.isInteger(numericChannel2G) || numericChannel2G < 1 || numericChannel2G > 11 ||
+        !Number.isInteger(numericChannel5G) || numericChannel5G < 36 || numericChannel5G > 144) {
+      addLog('AI', 'IA retornou canais fora dos intervalos permitidos', 'error', { elapsedMs: elapsed });
+      return res.status(502).json({ error: 'A IA não retornou uma recomendação válida.' });
+    }
 
     addLog('AI', `Recomendação IA concluída com sucesso`, 'success', {
-      channel2G, channel5G, rawResponse: iaText, elapsedMs: elapsed, model: 'qwen3.5:0.8b'
+      channel2G, channel5G, elapsedMs: elapsed, model: 'qwen3.5:0.8b'
     });
 
     res.json({ channel2G, channel5G, raw: iaText });
   } catch (error) {
-    addLog('AI', `Erro na recomendação IA`, 'error', { message: error.message, ollamaConnected: false });
+    addLog('AI', 'Erro na recomendação IA', 'error', { errorCode: error.code || 'OLLAMA_ERROR', ollamaConnected: false });
     res.status(500).json({ error: "Ollama desconectado ou demorou demais (limite 5 min)." });
   }
 });
@@ -350,18 +625,19 @@ app.post('/api/ai-recommend', async (req, res) => {
 // ============================================================
 
 app.get('/api/logs', (req, res) => {
-  const typeFilter = req.query.type || '';
-  const statusFilter = req.query.status || '';
-  const search = req.query.search || '';
-  const limit = parseInt(req.query.limit) || 200;
+  const typeFilter = typeof req.query.type === 'string' ? req.query.type.slice(0, 32) : '';
+  const statusFilter = typeof req.query.status === 'string' ? req.query.status.slice(0, 32) : '';
+  const search = typeof req.query.search === 'string' ? req.query.search.slice(0, 100) : '';
+  const requestedLimit = Number(req.query.limit || 200);
+  const limit = Number.isInteger(requestedLimit) ? Math.max(1, Math.min(requestedLimit, 500)) : 200;
 
   let filtered = [...logs].reverse();
 
   if (typeFilter) filtered = filtered.filter(l => l.type === typeFilter);
   if (statusFilter) filtered = filtered.filter(l => l.status === statusFilter);
   if (search) filtered = filtered.filter(l =>
-    l.detail.toLowerCase().includes(search.toLowerCase()) ||
-    JSON.stringify(l.extra).toLowerCase().includes(search.toLowerCase())
+    String(l.detail || '').toLowerCase().includes(search.toLowerCase()) ||
+    JSON.stringify(l.extra || {}).toLowerCase().includes(search.toLowerCase())
   );
 
   filtered = filtered.slice(0, limit);
@@ -375,21 +651,36 @@ app.get('/api/logs', (req, res) => {
 });
 
 app.delete('/api/logs', (req, res) => {
-  const count = logs.length;
+  let archiveName;
+  try {
+    archiveName = writeLogsArchive(logs);
+  } catch (error) {
+    addLog('SYSTEM', 'Falha ao arquivar logs', 'error', { errorCode: error.code || 'ARCHIVE_ERROR' });
+    return res.status(500).json({ error: 'Não foi possível arquivar os logs.' });
+  }
+
+  if (!appendAudit('logs_archived', { ip: req.ip, archiveName, count: logs.length })) {
+    return res.status(503).json({ error: 'Auditoria indisponível; os logs ativos foram preservados.' });
+  }
+
+  const previousLogs = logs;
   logs = [];
-  saveLogsToFile();
-  addLog('SYSTEM', `Logs limpos pelo usuário (${count} entradas removidas)`, 'info');
-  res.json({ success: true, removed: count });
+  if (!saveLogsToFile()) {
+    logs = previousLogs;
+    return res.status(500).json({ error: 'O arquivo foi arquivado, mas os logs ativos não puderam ser reiniciados.' });
+  }
+  addLog('SYSTEM', `Logs arquivados (${previousLogs.length} entradas)`, 'info', { archiveName });
+  return res.json({ success: true, archived: previousLogs.length, archiveName });
 });
 
-app.get('/logs', (req, res) => {
+app.get('/logs', noStore, (req, res) => {
   res.send(`
     <!DOCTYPE html>
     <html lang="pt-BR">
     <head>
       <meta charset="UTF-8">
       <title>Flashman Logs</title>
-      <style>
+      <style nonce="${res.locals.cspNonce}">
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0a0e1a; color: #e2e8f0; min-height: 100vh; }
         .topbar {
@@ -457,7 +748,7 @@ app.get('/logs', (req, res) => {
         .log-status-dot.warn { background: #f59e0b; }
         .log-time { font-size: 0.75rem; color: #64748b; }
         .log-detail { font-size: 0.9rem; color: #e2e8f0; }
-        .log-extra-toggle { font-size: 0.75rem; color: #38bdf8; cursor: pointer; margin-top: 0.3rem; user-select: none; }
+        .log-extra-toggle { border: 0; background: transparent; padding: 0; font-size: 0.75rem; color: #38bdf8; cursor: pointer; margin-top: 0.3rem; user-select: none; width: auto; font-weight: normal; }
         .log-extra-toggle:hover { color: #7dd3fc; }
         .log-extra-content {
           display: none; margin-top: 0.5rem; padding: 0.5rem; background: #0f172a;
@@ -467,6 +758,9 @@ app.get('/logs', (req, res) => {
         .log-extra-content.open { display: block; }
         .empty-state { text-align: center; padding: 3rem; color: #64748b; }
         .empty-state .icon { font-size: 3rem; margin-bottom: 1rem; }
+        .auth-panel { padding: 1rem 2rem; display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; background: #111827; border-bottom: 1px solid #1e293b; }
+        .auth-panel input { padding: 0.55rem 0.75rem; border-radius: 6px; border: 1px solid #334155; background: #1e293b; color: #e2e8f0; min-width: 260px; }
+        .auth-status { color: #94a3b8; font-size: 0.85rem; }
       </style>
     </head>
     <body>
@@ -477,6 +771,13 @@ app.get('/logs', (req, res) => {
           <span style="color: #64748b; font-size: 0.8rem;" id="lastUpdate"></span>
         </div>
       </div>
+      <form class="auth-panel" id="apiAuthForm">
+        <label for="apiTokenInput">Token de acesso</label>
+        <input id="apiTokenInput" type="password" autocomplete="current-password" placeholder="Cole o API_TOKEN" />
+        <button class="btn refresh" type="submit">Conectar</button>
+        <button class="btn clear" type="button" id="logoutButton" hidden>Sair</button>
+        <span class="auth-status" id="authStatus" role="status">Conecte-se para consultar os logs.</span>
+      </form>
       <div class="stats-bar" id="statsBar">
         <div class="stat-card total"><div class="num" id="statTotal">0</div><div class="label">Total</div></div>
         <div class="stat-card success"><div class="num" id="statSuccess">0</div><div class="label">Sucessos</div></div>
@@ -486,7 +787,7 @@ app.get('/logs', (req, res) => {
       </div>
       <div class="filters">
         <label>Tipo</label>
-        <select id="filterType" onchange="refreshLogs()">
+        <select id="filterType" data-requires-auth disabled>
           <option value="">Todos</option>
           <option value="AUTH">Auth</option>
           <option value="DEVICES">Devices</option>
@@ -497,7 +798,7 @@ app.get('/logs', (req, res) => {
           <option value="SYSTEM">System</option>
         </select>
         <label>Status</label>
-        <select id="filterStatus" onchange="refreshLogs()">
+        <select id="filterStatus" data-requires-auth disabled>
           <option value="">Todos</option>
           <option value="success">Sucesso</option>
           <option value="error">Erro</option>
@@ -505,16 +806,68 @@ app.get('/logs', (req, res) => {
           <option value="warn">Aviso</option>
         </select>
         <label>Buscar</label>
-        <input id="filterSearch" type="text" placeholder="Buscar nos logs..." oninput="refreshLogs()" />
-        <button class="btn refresh" onclick="refreshLogs()">🔄 Atualizar</button>
-        <button class="btn export" onclick="exportLogs()">📥 Exportar JSON</button>
-        <button class="btn clear" onclick="clearLogs()">🗑️ Limpar Todos</button>
+        <input id="filterSearch" data-requires-auth disabled type="text" placeholder="Buscar nos logs..." />
+        <button class="btn refresh" id="refreshButton" data-requires-auth disabled type="button">🔄 Atualizar</button>
+        <button class="btn export" id="exportButton" data-requires-auth disabled type="button">📥 Exportar JSON</button>
+        <button class="btn clear" id="clearButton" data-requires-auth disabled type="button">🗃️ Arquivar logs</button>
       </div>
       <div class="log-container" id="logContainer">
         <div class="empty-state"><div class="icon">📋</div>Carregando logs...</div>
       </div>
-      <script>
+      <script nonce="${res.locals.cspNonce}">
+        const API_TOKEN_STORAGE_KEY = 'scanWifiApiToken';
         let currentLogs = [];
+        let refreshTimer = null;
+        function setAuthStatus(message, isError = false) {
+          const status = document.getElementById('authStatus');
+          status.textContent = message;
+          status.style.color = isError ? '#fca5a5' : '#94a3b8';
+        }
+        function setAuthConnected(connected) {
+          document.querySelectorAll('[data-requires-auth]').forEach((element) => { element.disabled = !connected; });
+          if (refreshTimer !== null) clearInterval(refreshTimer);
+          refreshTimer = connected ? setInterval(refreshLogs, 5000) : null;
+        }
+        async function apiFetch(url, options = {}) {
+          const token = sessionStorage.getItem(API_TOKEN_STORAGE_KEY);
+          if (!token) throw new Error('Conecte-se com o API_TOKEN para continuar.');
+          const headers = new Headers(options.headers || {});
+          headers.set('Authorization', 'Bearer ' + token);
+          const response = await fetch(url, { ...options, headers });
+          if (response.status === 401) {
+            sessionStorage.removeItem(API_TOKEN_STORAGE_KEY);
+            document.getElementById('logoutButton').hidden = true;
+            setAuthStatus('Token inválido ou expirado. Conecte-se novamente.', true);
+            setAuthConnected(false);
+          }
+          return response;
+        }
+        async function connectApi(event) {
+          event.preventDefault();
+          const token = document.getElementById('apiTokenInput').value.trim();
+          if (!token) { setAuthStatus('Informe o API_TOKEN configurado no servidor.', true); return; }
+          try {
+            const response = await fetch('/api/auth/status', { headers: { Authorization: 'Bearer ' + token } });
+            if (!response.ok) throw new Error('Token inválido. Confira o valor configurado no servidor.');
+            sessionStorage.setItem(API_TOKEN_STORAGE_KEY, token);
+            document.getElementById('apiTokenInput').value = '';
+            document.getElementById('logoutButton').hidden = false;
+            setAuthConnected(true);
+            setAuthStatus('Conectado. O token fica guardado nesta aba até ela ser fechada.');
+            await refreshLogs();
+          } catch (error) {
+            setAuthStatus(error.message, true);
+          }
+        }
+        async function logoutApi() {
+          try { await apiFetch('/api/auth/logout', { method: 'POST' }); } catch {}
+          sessionStorage.removeItem(API_TOKEN_STORAGE_KEY);
+          setAuthConnected(false);
+          location.reload();
+        }
+        function escapeHtml(value) {
+          return String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
+        }
         function updateStats(logs) {
           document.getElementById('statTotal').textContent = logs.length;
           document.getElementById('statSuccess').textContent = logs.filter(l => l.status === 'success').length;
@@ -528,19 +881,20 @@ app.get('/logs', (req, res) => {
           container.innerHTML = logs.map(l => {
             const extraStr = l.extra && Object.keys(l.extra).length > 0 ? JSON.stringify(l.extra, null, 2) : '';
             const hasExtra = extraStr.length > 0;
+            const typeClass = ['AUTH', 'DEVICES', 'SCAN', 'INSTANT', 'AI', 'UPDATE', 'SYSTEM'].includes(l.type) ? l.type : 'SYSTEM';
+            const statusClass = ['success', 'error', 'info', 'warn'].includes(l.status) ? l.status : 'info';
             return '<div class="log-entry">'
               + '<div class="log-header">'
-              + '<span class="log-id">#' + l.id + '</span>'
-              + '<span class="log-type-badge ' + l.type + '">' + l.type + '</span>'
-              + '<span class="log-status-dot ' + l.status + '"></span>'
-              + '<span class="log-time">' + l.timestampLocal + '</span>'
+              + '<span class="log-id">#' + escapeHtml(l.id) + '</span>'
+              + '<span class="log-type-badge ' + typeClass + '">' + escapeHtml(l.type) + '</span>'
+              + '<span class="log-status-dot ' + statusClass + '"></span>'
+              + '<span class="log-time">' + escapeHtml(l.timestampLocal) + '</span>'
               + '</div>'
-              + '<div class="log-detail">' + l.detail + '</div>'
-              + (hasExtra ? '<div class="log-extra-toggle" onclick="toggleExtra(this)">▸ Detalhes (' + Object.keys(l.extra).length + ' campos)</div><div class="log-extra-content">' + extraStr + '</div>' : '')
+              + '<div class="log-detail">' + escapeHtml(l.detail) + '</div>'
+              + (hasExtra ? '<button class="log-extra-toggle" type="button" data-toggle-extra>▸ Detalhes (' + Object.keys(l.extra).length + ' campos)</button><div class="log-extra-content">' + escapeHtml(extraStr) + '</div>' : '')
               + '</div>';
           }).join('');
         }
-        function toggleExtra(el) { const content = el.nextElementSibling; const isOpen = content.classList.contains('open'); content.classList.toggle('open'); el.textContent = isOpen ? '▸ Detalhes' : '▾ Detalhes'; }
         async function refreshLogs() {
           const type = document.getElementById('filterType').value;
           const status = document.getElementById('filterStatus').value;
@@ -551,15 +905,20 @@ app.get('/logs', (req, res) => {
             if (status) params.set('status', status);
             if (search) params.set('search', search);
             params.set('limit', '200');
-            const res = await fetch('/api/logs?' + params.toString());
+            const res = await apiFetch('/api/logs?' + params.toString());
             const data = await res.json();
+            if (!res.ok) throw new Error(data.error || 'Erro ao carregar logs.');
             currentLogs = data.logs; updateStats(data.logs); renderLogs(data.logs);
             document.getElementById('lastUpdate').textContent = 'Atualizado: ' + new Date().toLocaleTimeString('pt-BR');
-          } catch(e) { document.getElementById('logContainer').innerHTML = '<div class="empty-state"><div class="icon">❌</div>Erro ao carregar logs: ' + e.message + '</div>'; }
+          } catch(e) { document.getElementById('logContainer').textContent = 'Erro ao carregar logs: ' + e.message; }
         }
         async function clearLogs() {
-          if (!confirm('Tem certeza que deseja limpar TODOS os logs? Essa ação não pode ser desfeita.')) return;
-          try { const res = await fetch('/api/logs', { method: 'DELETE' }); const data = await res.json(); alert('Logs limpos! ' + data.removed + ' entradas removidas.'); refreshLogs(); } catch(e) { alert('Erro: ' + e.message); }
+          if (!confirm('Arquivar os logs atuais? O arquivo ficará preservado no servidor.')) return;
+          try {
+            const res = await apiFetch('/api/logs', { method: 'DELETE' }); const data = await res.json();
+            if (!res.ok) throw new Error(data.error || 'Falha ao arquivar os logs.');
+            alert('Logs arquivados: ' + data.archived + ' entradas.'); refreshLogs();
+          } catch(e) { alert('Erro: ' + e.message); }
         }
         function exportLogs() {
           const data = JSON.stringify(currentLogs, null, 2);
@@ -567,8 +926,27 @@ app.get('/logs', (req, res) => {
           const url = URL.createObjectURL(blob);
           const a = document.createElement('a'); a.href = url; a.download = 'flashman_logs_' + new Date().toISOString().slice(0, 10) + '.json'; a.click(); URL.revokeObjectURL(url);
         }
-        setInterval(refreshLogs, 5000);
-        window.onload = refreshLogs;
+        document.getElementById('apiAuthForm').addEventListener('submit', connectApi);
+        document.getElementById('logoutButton').addEventListener('click', logoutApi);
+        document.getElementById('refreshButton').addEventListener('click', refreshLogs);
+        document.getElementById('exportButton').addEventListener('click', exportLogs);
+        document.getElementById('clearButton').addEventListener('click', clearLogs);
+        document.getElementById('filterType').addEventListener('change', refreshLogs);
+        document.getElementById('filterStatus').addEventListener('change', refreshLogs);
+        document.getElementById('filterSearch').addEventListener('input', refreshLogs);
+        document.getElementById('logContainer').addEventListener('click', (event) => {
+          const button = event.target.closest('[data-toggle-extra]');
+          if (!button) return;
+          const content = button.nextElementSibling;
+          const isOpen = content.classList.toggle('open');
+          button.textContent = isOpen ? '▾ Detalhes' : '▸ Detalhes';
+        });
+        if (sessionStorage.getItem(API_TOKEN_STORAGE_KEY)) {
+          document.getElementById('logoutButton').hidden = false;
+          setAuthConnected(true);
+          setAuthStatus('Conectado nesta aba.');
+          refreshLogs();
+        } else setAuthConnected(false);
       </script>
     </body>
     </html>
@@ -579,14 +957,14 @@ app.get('/logs', (req, res) => {
 // 🌐 INTERFACE WEB PRINCIPAL
 // ============================================================
 
-app.get('/', (req, res) => {
+app.get('/', noStore, (req, res) => {
   res.send(`
     <!DOCTYPE html>
     <html lang="pt-BR">
     <head>
       <meta charset="UTF-8">
       <title>Flashman Wi-Fi Optimizer</title>
-      <style>
+      <style nonce="${res.locals.cspNonce}">
         body { font-family: system-ui, sans-serif; background: #0f172a; color: #f8fafc; padding: 2rem; display: flex; justify-content: center; margin: 0; }
         .card { background: #1e293b; padding: 2rem; border-radius: 12px; border: 1px solid #334155; max-width: 1200px; width: 100%; }
         h1 { margin-top: 0; border-bottom: 1px solid #334155; padding-bottom: 1rem; display: flex; align-items: center; justify-content: space-between; }
@@ -611,6 +989,10 @@ app.get('/', (req, res) => {
         .section-box { background: #0f172a; padding: 1.5rem; border-radius: 8px; border: 1px solid #334155; }
         .log-counter { font-size: 0.8rem; color: #64748b; margin-top: 0.5rem; }
         .pagination-info { font-size: 0.8rem; color: #94a3b8; margin-top: 0.25rem; }
+        .auth-panel { display: flex; align-items: end; gap: 0.75rem; flex-wrap: wrap; background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+        .auth-panel > div { flex: 1 1 260px; }
+        .auth-panel input { max-width: 420px; }
+        .auth-status { color: #94a3b8; font-size: 0.85rem; align-self: center; }
       </style>
     </head>
     <body>
@@ -619,40 +1001,50 @@ app.get('/', (req, res) => {
           <span>📶 Flashman Wi-Fi Optimizer</span>
           <a href="/logs">📋 Ver Logs →</a>
         </h1>
+
+        <form class="auth-panel" id="apiAuthForm">
+          <div>
+            <label for="apiTokenInput">Token de acesso</label>
+            <input id="apiTokenInput" type="password" autocomplete="current-password" placeholder="Cole o API_TOKEN" />
+          </div>
+          <button type="submit" style="width: auto;">Conectar</button>
+          <button type="button" id="logoutButton" hidden style="width: auto;">Sair</button>
+          <span class="auth-status" id="authStatus" role="status">Conecte-se antes de consultar ou alterar roteadores.</span>
+        </form>
         
         <div class="grid-3 mb-1">
           <div>
             <label>Qtd. de Aparelhos</label>
-            <input id="qtyInput" type="number" value="100" min="1" max="5000" />
+            <input id="qtyInput" data-requires-auth disabled type="number" value="100" min="1" max="5000" />
             <div class="pagination-info" id="paginationInfo"></div>
           </div>
-          <div><label>Selecionar da Lista</label><select id="devSel" disabled onchange="syncSN()"><option>Carregando...</option></select></div>
-          <div><label>Ou digite o SN Manual</label><input id="snInput" type="text" placeholder="Ex: ZTEEQL4Q3B06071" /></div>
+          <div><label>Selecionar da Lista</label><select id="devSel" data-requires-auth disabled><option>Conecte-se para carregar.</option></select></div>
+          <div><label>Ou digite o SN Manual</label><input id="snInput" data-requires-auth disabled type="text" placeholder="Ex: ZTEEQL4Q3B06071" /></div>
         </div>
         
         <div class="mb-1" style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem;">
-          <button onclick="loadDevices()">🔄 Carregar Lista</button>
-          <button onclick="startScan()">🔍 Escanear Redes</button>
-          <button class="instant" onclick="instantRecommend()" id="btnInstant" disabled>⚡ Recomendar (Instantâneo)</button>
+          <button type="button" data-requires-auth disabled id="loadDevicesButton">🔄 Carregar Lista</button>
+          <button type="button" data-requires-auth disabled id="startScanButton">🔍 Escanear Redes</button>
+          <button type="button" data-requires-auth disabled class="instant" id="btnInstant">⚡ Recomendar (Instantâneo)</button>
         </div>
         
         <div style="margin-bottom: 1rem;">
-           <button class="ai" onclick="askAI()" id="btnAI" disabled style="width: 100%; background: #4c1d95;">🧠 Recomendar com IA Local (Demora ~4 minutos! Use só para testar)</button>
+           <button type="button" data-requires-auth disabled class="ai" id="btnAI" disabled style="width: 100%; background: #4c1d95;">🧠 Recomendar com IA Local (Demora ~4 minutos! Use só para testar)</button>
         </div>
 
         <div class="grid-2 mb-1 section-box">
           <div>
             <label>Canal 2.4GHz (1 a 11)</label>
             <div class="grid-2" style="gap: 0.5rem;">
-              <input id="channel2G" type="number" placeholder="Ex: 6" min="1" max="11" />
-              <button class="apply" onclick="applyChannel('2G')">Aplicar 2G</button>
+              <input id="channel2G" data-requires-auth disabled type="number" placeholder="Ex: 6" min="1" max="11" />
+              <button type="button" data-requires-auth disabled class="apply" data-apply-band="2G">Aplicar 2G</button>
             </div>
           </div>
           <div>
             <label>Canal 5GHz (36 a 144)</label>
             <div class="grid-2" style="gap: 0.5rem;">
-              <input id="channel5G" type="number" placeholder="Ex: 100" min="36" max="144" />
-              <button class="apply" onclick="applyChannel('5G')">Aplicar 5G</button>
+              <input id="channel5G" data-requires-auth disabled type="number" placeholder="Ex: 100" min="36" max="144" />
+              <button type="button" data-requires-auth disabled class="apply" data-apply-band="5G">Aplicar 5G</button>
             </div>
           </div>
         </div>
@@ -666,8 +1058,68 @@ app.get('/', (req, res) => {
         </div>
       </div>
 
-      <script>
+      <script nonce="${res.locals.cspNonce}">
+        const API_TOKEN_STORAGE_KEY = 'scanWifiApiToken';
         let lastScanData = null;
+
+        function setAuthConnected(connected) {
+          document.querySelectorAll('[data-requires-auth]').forEach((element) => { element.disabled = !connected; });
+          document.getElementById('btnInstant').disabled = !connected || !lastScanData;
+          document.getElementById('btnAI').disabled = !connected || !lastScanData;
+        }
+
+        function setAuthStatus(message, isError = false) {
+          const status = document.getElementById('authStatus');
+          status.textContent = message;
+          status.style.color = isError ? '#fca5a5' : '#94a3b8';
+        }
+
+        async function apiFetch(url, options = {}) {
+          const token = sessionStorage.getItem(API_TOKEN_STORAGE_KEY);
+          if (!token) throw new Error('Conecte-se com o API_TOKEN para continuar.');
+          const headers = new Headers(options.headers || {});
+          headers.set('Authorization', 'Bearer ' + token);
+          const response = await fetch(url, { ...options, headers });
+          if (response.status === 401) {
+            sessionStorage.removeItem(API_TOKEN_STORAGE_KEY);
+            document.getElementById('logoutButton').hidden = true;
+            setAuthStatus('Token inválido ou expirado. Conecte-se novamente.', true);
+            setAuthConnected(false);
+          }
+          return response;
+        }
+
+        async function connectApi(event) {
+          event.preventDefault();
+          const token = document.getElementById('apiTokenInput').value.trim();
+          if (!token) { setAuthStatus('Informe o API_TOKEN configurado no servidor.', true); return; }
+          try {
+            const response = await fetch('/api/auth/status', { headers: { Authorization: 'Bearer ' + token } });
+            if (!response.ok) throw new Error('Token inválido. Confira o valor configurado no servidor.');
+            sessionStorage.setItem(API_TOKEN_STORAGE_KEY, token);
+            document.getElementById('apiTokenInput').value = '';
+            document.getElementById('logoutButton').hidden = false;
+            setAuthConnected(true);
+            setAuthStatus('Conectado. O token fica guardado nesta aba até ela ser fechada.');
+            await Promise.all([loadDevices(), updateLogCounter()]);
+          } catch (error) {
+            setAuthStatus(error.message, true);
+          }
+        }
+
+        async function logoutApi() {
+          try { await apiFetch('/api/auth/logout', { method: 'POST' }); } catch {}
+          sessionStorage.removeItem(API_TOKEN_STORAGE_KEY);
+          document.getElementById('logoutButton').hidden = true;
+          lastScanData = null;
+          setAuthConnected(false);
+          document.getElementById('devSel').replaceChildren(new Option('Conecte-se para carregar.', ''));
+          document.getElementById('resultsSection').style.display = 'none';
+          document.getElementById('channel2G').value = '';
+          document.getElementById('channel5G').value = '';
+          setAuthStatus('Sessão encerrada.');
+          showStatus('Conecte-se para consultar ou alterar roteadores.', 'warn');
+        }
 
         function showStatus(msg, type) {
           const el = document.getElementById('status');
@@ -679,13 +1131,15 @@ app.get('/', (req, res) => {
 
         async function updateLogCounter() {
           try {
-            const res = await fetch('/api/logs?limit=1');
+            const res = await apiFetch('/api/logs?limit=1');
+            if (!res.ok) return;
             const data = await res.json();
             document.getElementById('logCounter').textContent = '📋 ' + data.total + ' logs registrados → Ver em /logs';
           } catch(e) {}
         }
 
         async function loadDevices() {
+          if (!sessionStorage.getItem(API_TOKEN_STORAGE_KEY)) return;
           const sel = document.getElementById('devSel');
           const qty = document.getElementById('qtyInput').value || 10;
           const pages = Math.ceil(qty / 50);
@@ -693,19 +1147,26 @@ app.get('/', (req, res) => {
           document.getElementById('btnInstant').disabled = true;
           document.getElementById('btnAI').disabled = true;
           document.getElementById('resultsSection').style.display = 'none';
-          sel.innerHTML = '<option>Carregando ' + qty + ' em ' + pages + ' páginas...</option>'; sel.disabled = true;
+          sel.replaceChildren(new Option('Carregando ' + qty + ' em ' + pages + ' páginas...', '')); sel.disabled = true;
           try {
             showStatus('⏳ Buscando ' + qty + ' equipamentos (' + pages + ' páginas)...', 'warn');
-            const res = await fetch('/api/devices?qty=' + qty);
+            const res = await apiFetch('/api/devices?qty=' + encodeURIComponent(qty));
             const data = await res.json(); if (!res.ok) throw new Error(data.error || 'Erro');
             const devs = data.devices || [];
             const pagesUsed = data.pagesUsed || pages;
             document.getElementById('paginationInfo').textContent = qty + ' solicitados → ' + devs.length + ' carregados em ' + pagesUsed + ' páginas';
-            sel.innerHTML = '<option value="">-- Selecione (' + devs.length + ') --</option>';
+            sel.replaceChildren(new Option('-- Selecione (' + devs.length + ') --', ''));
             devs.forEach(d => {
-              const sn = d.serialNumber || d.sn || d.deviceInfo?.serialNumber || d._id || d.macs?.[0];
-              const label = [d.deviceInfo?.manufacturer, d.deviceInfo?.modelName, 'SN:'+sn].filter(Boolean).join(' - ');
-              sel.innerHTML += '<option value="' + sn + '">' + label + '</option>';
+              if (!d || typeof d !== 'object') return;
+              const sn = [d.serialNumber, d.sn, d.deviceInfo?.serialNumber, d._id, d.macs?.[0]]
+                .find(value => typeof value === 'string' && value.trim());
+              if (!sn) return;
+              const label = [d.deviceInfo?.manufacturer, d.deviceInfo?.modelName, 'SN:' + sn]
+                .filter(value => typeof value === 'string' && value.trim()).join(' - ');
+              const option = document.createElement('option');
+              option.value = sn;
+              option.textContent = label;
+              sel.append(option);
             });
             sel.disabled = false; hideStatus();
             updateLogCounter();
@@ -714,6 +1175,7 @@ app.get('/', (req, res) => {
 
         async function startScan() {
           const sn = getActiveSN(); if (!sn) { alert('Selecione ou digite o SN!'); return; }
+          lastScanData = null;
           document.getElementById('resultsSection').style.display = 'grid';
           document.getElementById('out').textContent = 'Escaneando...';
           document.getElementById('aiLog').textContent = '';
@@ -721,12 +1183,11 @@ app.get('/', (req, res) => {
           document.getElementById('btnAI').disabled = true;
           try {
             showStatus('⏳ Escaneando redes vizinhas...', 'warn');
-            const res = await fetch('/api/scan/' + encodeURIComponent(sn));
+            const res = await apiFetch('/api/scan/' + encodeURIComponent(sn));
             const data = await res.json(); if (!res.ok) throw new Error(data.error || 'Erro');
             lastScanData = data; hideStatus();
             document.getElementById('out').textContent = JSON.stringify(data, null, 2);
-            document.getElementById('btnInstant').disabled = false;
-            document.getElementById('btnAI').disabled = false;
+            setAuthConnected(true);
             updateLogCounter();
           } catch(e) { showStatus('Erro: ' + e.message, 'error'); updateLogCounter(); }
         }
@@ -735,7 +1196,7 @@ app.get('/', (req, res) => {
           if (!lastScanData) return;
           document.getElementById('aiLog').textContent = 'Calculando algoritmo matemático...';
           try {
-            const res = await fetch('/api/instant-recommend', {
+            const res = await apiFetch('/api/instant-recommend', {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ scanData: lastScanData })
             });
@@ -752,7 +1213,7 @@ app.get('/', (req, res) => {
           if (!lastScanData) return;
           document.getElementById('aiLog').textContent = '🧠 IA Pensando... Isso demora cerca de 4 minutos, por favor aguarde sem fechar a página.';
           try {
-            const res = await fetch('/api/ai-recommend', {
+            const res = await apiFetch('/api/ai-recommend', {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ scanData: lastScanData })
             });
@@ -772,13 +1233,17 @@ app.get('/', (req, res) => {
         async function applyChannel(band) {
           const sn = getActiveSN();
           const channel = document.getElementById(band === '2G' ? 'channel2G' : 'channel5G').value;
-          if (!sn || !channel) { alert('SN e Canal são obrigatórios!'); return; }
+          const numericChannel = Number(channel);
+          const channelIsValid = Number.isInteger(numericChannel) && (band === '2G'
+            ? numericChannel >= 1 && numericChannel <= 11
+            : numericChannel >= 36 && numericChannel <= 144);
+          if (!sn || !channelIsValid) { alert('Informe um SN e um canal inteiro dentro do intervalo da banda.'); return; }
           if (!confirm('Aplicar Canal ' + channel + ' (' + band + ') no ' + sn + '?')) return;
           try {
             showStatus('⏳ Aplicando Canal...', 'warn');
-            const res = await fetch('/api/update-channel', {
+            const res = await apiFetch('/api/update-channel', {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ sn, band, channel: parseInt(channel) })
+              body: JSON.stringify({ sn, band, channel: numericChannel })
             });
             const data = await res.json(); if (!res.ok) throw new Error(data.error || 'Erro');
             showStatus('✅ Canal ' + channel + ' (' + band + ') aplicado!', 'success');
@@ -786,14 +1251,48 @@ app.get('/', (req, res) => {
           } catch(e) { showStatus('Erro: ' + e.message, 'error'); updateLogCounter(); }
         }
 
-        window.onload = loadDevices;
+        document.getElementById('apiAuthForm').addEventListener('submit', connectApi);
+        document.getElementById('logoutButton').addEventListener('click', logoutApi);
+        document.getElementById('loadDevicesButton').addEventListener('click', loadDevices);
+        document.getElementById('startScanButton').addEventListener('click', startScan);
+        document.getElementById('btnInstant').addEventListener('click', instantRecommend);
+        document.getElementById('btnAI').addEventListener('click', askAI);
+        document.getElementById('devSel').addEventListener('change', syncSN);
+        document.querySelectorAll('[data-apply-band]').forEach(button => {
+          button.addEventListener('click', () => applyChannel(button.dataset.applyBand));
+        });
+        if (sessionStorage.getItem(API_TOKEN_STORAGE_KEY)) {
+          document.getElementById('logoutButton').hidden = false;
+          setAuthStatus('Validando sessão desta aba...');
+          fetch('/api/auth/status', { headers: { Authorization: 'Bearer ' + sessionStorage.getItem(API_TOKEN_STORAGE_KEY) } })
+            .then(response => {
+              if (!response.ok) throw new Error('Token inválido. Conecte-se novamente.');
+              setAuthConnected(true);
+              setAuthStatus('Conectado nesta aba.');
+              return Promise.all([loadDevices(), updateLogCounter()]);
+            })
+            .catch(error => {
+              sessionStorage.removeItem(API_TOKEN_STORAGE_KEY);
+              document.getElementById('logoutButton').hidden = true;
+              setAuthConnected(false);
+              setAuthStatus(error.message, true);
+            });
+        } else setAuthConnected(false);
       </script>
     </body>
     </html>
   `);
 });
 
-app.listen(PORT, () => {
+app.use((error, _req, res, next) => {
+  if (res.headersSent) return next(error);
+  if (error.type === 'entity.too.large') return res.status(413).json({ error: 'Corpo da requisição excede o limite de 100 KB.' });
+  if (error.type === 'entity.parse.failed') return res.status(400).json({ error: 'JSON inválido.' });
+  console.error('Erro interno ao processar requisição:', error.code || 'REQUEST_ERROR');
+  return res.status(500).json({ error: 'Não foi possível processar a solicitação.' });
+});
+
+app.listen(PORT, HOST, () => {
   addLog('SYSTEM', `Servidor iniciado na porta ${PORT}`, 'success', { port: PORT, nodeVersion: process.version, maxPageSize: FLASHMAN_MAX_PAGE_SIZE });
   console.log(`🚀 Servidor rodando em http://localhost:${PORT}`);
   console.log(`📋 Logs disponíveis em http://localhost:${PORT}/logs`);

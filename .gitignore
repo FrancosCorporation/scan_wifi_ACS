@@ -1,3 +1,5 @@
 node_modules/
 .env
 flashman_logs.json
+flashman_audit.jsonl
+log_archive/

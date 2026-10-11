@@ -4,4 +4,7 @@ dist
 build
 *.log
 .env
+flashman_logs.json
+flashman_audit.jsonl
+log_archive/
 npm-debug.log*

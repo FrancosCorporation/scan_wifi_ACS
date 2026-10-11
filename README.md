@@ -1,88 +1,81 @@
 # scan_wifi_ACS
 
-## 🐳 Instalação e Execução (Docker) — recomendado
+Painel interno para consultar dispositivos no Flashman ACS, executar diagnósticos de redes vizinhas e recomendar canais Wi-Fi. A recomendação pode usar o algoritmo local ou o Ollama.
 
-### Pré-requisitos
-- [Docker](https://docs.docker.com/get-docker/) + Docker Compose
+## Permissões e cuidado operacional
 
-### Rodar com Docker
+Este serviço acessa a API Flashman com credenciais OAuth2. Ele lista números de série, inicia diagnósticos nos roteadores e pode **alterar o canal Wi-Fi de equipamentos reais**. Uma alteração pode desconectar dispositivos por alguns instantes.
+
+Todas as rotas `/api/*` exigem o segredo `API_TOKEN`. Não exponha o serviço à internet ou a uma rede compartilhada sem TLS e controle de acesso de rede. Por padrão, o processo escuta apenas em `127.0.0.1`. Em Docker, o processo escuta na rede do container; o exemplo publica a porta somente no loopback do host.
+
+O token é compartilhado por quem opera o painel e fica em `sessionStorage` apenas na aba atual. Ele dá acesso a todas as funções do serviço. Guarde-o como uma credencial e não o envie em chamados ou logs.
+
+## Configuração local
+
+Requer Node.js 22 ou mais recente.
+
 ```bash
-docker compose up --build
+npm ci
+cp .env.example .env
 ```
 
+Edite `.env`, informe as credenciais OAuth2 Flashman e crie um token aleatório:
 
-### Sem Docker (local)
 ```bash
-npm install
+openssl rand -base64 48
+```
+
+Cole o resultado em `API_TOKEN` e inicie o painel:
+
+```bash
 npm start
 ```
 
+Abra `http://127.0.0.1:3000`, conecte usando o valor de `API_TOKEN` e escolha um roteador. A interface pede confirmação antes de enviar uma alteração de canal.
 
-Serviço de integração em **Node.js/Express** que consulta a API do sistema
-**Flashman** (gestão de provedores/ACS), pagina os resultados, mantém um log
-local e usa IA local (Ollama) para analisar os logs.
+Para usar recomendações via IA, inicie o Ollama, baixe `qwen3.5:0.8b` e configure `OLLAMA_URL` se ele não estiver em `http://127.0.0.1:11434`.
 
-![Node.js](https://img.shields.io/badge/Node.js-339933?style=flat-square&logo=nodedotjs&logoColor=white)
-![Express](https://img.shields.io/badge/Express-000000?style=flat-square&logo=express&logoColor=white)
-![Ollama](https://img.shields.io/badge/Ollama-IA%20local-black?style=flat-square)
-![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
-![Status](https://img.shields.io/badge/status-ferramenta%20interna-orange?style=flat-square)
+## Docker
 
-## Sobre
-
-Ferramenta de uso interno para integrar com a API do Flashman (OLV Telecom),
-coletando dados paginados com credenciais de cliente e registrando tudo em
-arquivo, com endpoints próprios para consultar os logs. Há integração opcional
-com o Ollama para análise dos registros por IA local.
-
-## Funcionalidades
-
-Comprovadas pelo código em `serve.js`:
-
-- Servidor Express na porta `3000` com `dns` forçado a IPv4.
-- Autenticação na API do Flashman via **client id/secret** (agora lidos de
-  variáveis de ambiente — veja `.env.example`).
-- Consumo paginado da API (`FLASHMAN_MAX_PAGE_SIZE = 50`).
-- Sistema próprio de **logs** persistidos em `flashman_logs.json`, com
-  endpoints para listar/filtrar logs.
-- Integração opcional com **Ollama** (`qwen3.5:0.8b`) para análise dos logs.
-
-## Como rodar
+O projeto tem `Dockerfile`, mas não contém um arquivo Compose. Crie `.env` com os valores acima e execute:
 
 ```bash
-npm install
-cp .env.example .env   # preencha as credenciais do Flashman
-node server.js         # ou: node --watch server.js
+docker build -t scan-wifi-acs .
+docker volume create scan-wifi-acs-data
+docker run -d --name scan-wifi-acs \
+  --env-file .env \
+  -p 127.0.0.1:3000:3000 \
+  --mount source=scan-wifi-acs-data,target=/data \
+  scan-wifi-acs
 ```
 
-Consultar logs:
+O volume mantém logs, auditoria e arquivos arquivados entre reinícios. O container roda como usuário sem privilégios e inclui healthcheck em `/health`. Para conectar o Ollama que roda no host, ajuste `OLLAMA_URL` para um endereço acessível a partir do container.
 
-```bash
-curl http://localhost:3000/api/logs
-```
+Se Flashman usar uma CA privada, monte o arquivo PEM como somente leitura no container e configure `FLASHMAN_CA_FILE` para o caminho dentro dele.
 
-Para análise com IA, tenha o Ollama rodando (`ollama serve`) e o modelo
-baixado (`ollama pull qwen3.5:0.8b`).
+## Variáveis de ambiente
 
-## Configuração
-
-| Variável | Descrição |
+| Variável | Uso |
 |---|---|
-| `FLASHMAN_CLIENT_ID` | Client ID da API do Flashman |
-| `FLASHMAN_CLIENT_SECRET` | Client secret da API do Flashman |
-| `FLASHMAN_API_BASE_URL` | Base da API (padrão: `https://flashman.olvtelecom.com.br`) |
-| `OLLAMA_URL` | URL do Ollama (opcional) |
+| `FLASHMAN_CLIENT_ID` | Client ID OAuth2 Flashman |
+| `FLASHMAN_CLIENT_SECRET` | Client secret OAuth2 Flashman |
+| `API_TOKEN` | Segredo aleatório de pelo menos 32 bytes para as rotas da API |
+| `FLASHMAN_API_BASE_URL` | Base HTTPS da API Flashman |
+| `FLASHMAN_CA_FILE` | PEM opcional da CA privada da API Flashman |
+| `OLLAMA_URL` | Base HTTP(S) do Ollama |
+| `HOST` / `PORT` | Interface e porta locais; padrão `127.0.0.1:3000` |
+| `TRUST_PROXY` | IPs ou sub-redes dos proxies reversos confiáveis; mantenha vazio sem proxy |
+| `LOG_FILE` | Caminho do log operacional persistido |
+| `AUDIT_FILE` | Caminho do registro de auditoria append-only |
+| `LOG_ARCHIVE_DIR` | Diretório dos arquivos de log arquivados |
 
-> As credenciais que estavam embutidas no código foram movidas para variáveis
-> de ambiente. Se a versão antiga vazou, **rotacione o client secret** no
-> painel do provedor.
+Se credenciais antigas foram publicadas ou compartilhadas, rotacione o client secret no provedor. Veja [SECURITY.md](SECURITY.md) para as regras de segurança e operação.
 
-## Estrutura do projeto
+## Verificação estática
 
-```
-serve.js          # servidor Express + integração Flashman + logs
-package.json      # dependências (express, axios)
-readme.md         # roteiro original de setup
+```bash
+npm run check
+npm audit --audit-level=high
 ```
 
 ## Licença
