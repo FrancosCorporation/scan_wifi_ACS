@@ -34,6 +34,7 @@ Revisão e implementação concluídas em 2026-10-11 sobre o projeto Node.js/Exp
 - `/health` retorna `200` com estado `degraded` se o Ollama estiver indisponível, pois a consulta determinística continua funcional.
 - `TEST-01` permanece pendente. A execução atual não adicionou nem executou testes automatizados.
 - `DEVOPS-03`: workflow fixado em Ubuntu 24.04, Actions v7 e matriz Node 22/24, alinhada ao mínimo declarado no pacote. A matriz valida os dois majors suportados sem chamar APIs externas nem iniciar o serviço.
+- CI `38195212808` passou nos dois jobs (Node 22 e 24), incluindo `npm ci`, `npm run check`, `npm audit --audit-level=high` e a barreira do middleware Bearer. Localmente, `npm run check`, audit (0 vulnerabilidades), assertions estruturais do workflow e `git diff --check` passaram. Commit `5d41103` está publicado em `origin/main`; nenhum teste, serviço, Ollama, Flashman ou roteador foi acessado.
 
 ## Verificação estática
 
