@@ -22,6 +22,7 @@ Revisão e implementação concluídas em 2026-10-11 sobre o projeto Node.js/Exp
 | TEST-01 | Testes automatizados de rotas e recomendação | Pendente para tarefa própria |
 | DEVOPS-01 | CI com verificação estática, auditoria npm e barreira de autenticação | Concluído |
 | DEVOPS-02 | Dockerfile não root, healthcheck e volume de dados persistente | Concluído |
+| DEVOPS-03 | CI previsível em Ubuntu 24.04, Actions atuais e Node 22/24 | Concluído |
 | DOC-01 | README documenta poderes de alteração dos roteadores e o risco | Concluído |
 | DOC-02 | Política de segurança e operação em `SECURITY.md` | Concluído |
 
@@ -32,6 +33,7 @@ Revisão e implementação concluídas em 2026-10-11 sobre o projeto Node.js/Exp
 - O limite de requisições é mantido em memória e usa o IP observado pelo Express. Com proxy reverso, configure `TRUST_PROXY` somente com os endereços confiáveis.
 - `/health` retorna `200` com estado `degraded` se o Ollama estiver indisponível, pois a consulta determinística continua funcional.
 - `TEST-01` permanece pendente. A execução atual não adicionou nem executou testes automatizados.
+- `DEVOPS-03`: workflow fixado em Ubuntu 24.04, Actions v7 e matriz Node 22/24, alinhada ao mínimo declarado no pacote. A matriz valida os dois majors suportados sem chamar APIs externas nem iniciar o serviço.
 
 ## Verificação estática
 
